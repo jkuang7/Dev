@@ -23,6 +23,9 @@ log "balance: rebalancing $WS"
 # Load existing state (preserve user choices)
 read_state "$WS"
 
+# Rebuild from a clean workspace envelope.
+converge_all_windows_to_workspace "$WS"
+
 # Rebuild with existing state (force to fix column order + sizing)
 rebuild_workspace "$WS" force
 

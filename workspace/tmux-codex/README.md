@@ -76,7 +76,7 @@ Install prompt into Codex:
 bash /Users/jian/Dev/workspace/tmux-codex/scripts/install-codex-run-prompt.sh
 ```
 
-This links `~/.codex/prompts/run.md`, `~/.codex/prompts/add.md`, the four phase prompts, and the legacy `runner-cycle.md` compatibility prompt to the global prompt specs in `/Users/jian/Dev/workspace/codex/prompts`.
+This validates `~/.codex/prompts/run.md`, `~/.codex/prompts/add.md`, the four phase prompts, and the legacy `runner-cycle.md` compatibility prompt in the global Codex home.
 
 ## Runner Runtime
 

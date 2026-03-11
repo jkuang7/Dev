@@ -6,6 +6,7 @@
 
 # root control files
 !/AGENTS.md
+!/.custom
 !/.vscode/
 !/.vscode/**
 !/workspace/

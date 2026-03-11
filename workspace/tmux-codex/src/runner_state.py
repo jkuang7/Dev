@@ -40,7 +40,7 @@ def codex_home(dev: str) -> Path:
     override = os.environ.get("CODEX_HOME")
     if override:
         return Path(override).expanduser().resolve()
-    return (workspace_home(dev) / "codex").resolve()
+    return (Path.home() / ".codex").resolve()
 
 
 def worktrees_home(dev: str) -> Path:

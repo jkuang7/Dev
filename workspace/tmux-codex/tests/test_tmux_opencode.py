@@ -200,7 +200,7 @@ class SessionMenuRunTests(unittest.TestCase):
             tmux.list_sessions.return_value = []
             tmux.get_pane_title.return_value = None
 
-            with patch.dict(os.environ, {"DEV": str(dev)}):
+            with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev)}):
                 menu = SessionMenu(tmux)
                 with patch.object(menu, "_get_all_projects", return_value=[("Blog", 0), ("Shop", 0)]), patch.object(
                     menu, "_active_runner_projects", return_value={"Blog"}
@@ -209,7 +209,7 @@ class SessionMenuRunTests(unittest.TestCase):
 
             self.assertEqual(result, (["Shop"], "high"))
 
-    def test_persists_prefs_and_tags_into_workspace_codex_namespace(self):
+    def test_persists_prefs_and_tags_into_global_codex_namespace(self):
         with tempfile.TemporaryDirectory() as tmp:
             dev = Path(tmp)
 
@@ -217,13 +217,13 @@ class SessionMenuRunTests(unittest.TestCase):
             tmux.list_sessions.return_value = []
             tmux.get_pane_title.return_value = None
 
-            with patch.dict(os.environ, {"DEV": str(dev)}):
+            with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev)}):
                 menu = SessionMenu(tmux)
                 menu._save_runner_prefs({"Blog"}, "high")
                 menu._save_tags({"codex-1": "Session"})
 
-            self.assertTrue((dev / "workspace" / "codex" / "config" / "runner-prefs.json").exists())
-            self.assertTrue((dev / "workspace" / "codex" / "session-tags.json").exists())
+            self.assertTrue((dev / ".codex" / "config" / "runner-prefs.json").exists())
+            self.assertTrue((dev / ".codex" / "session-tags.json").exists())
 
     def test_runner_complexity_pref_is_persisted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,7 +232,7 @@ class SessionMenuRunTests(unittest.TestCase):
             tmux.list_sessions.return_value = []
             tmux.get_pane_title.return_value = None
 
-            with patch.dict(os.environ, {"DEV": str(dev)}):
+            with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev)}):
                 menu = SessionMenu(tmux)
                 menu._save_runner_prefs({"Blog"}, "xhigh")
                 self.assertEqual(menu._load_runner_complexity(), "xhigh")
@@ -245,7 +245,7 @@ class SessionMenuRunTests(unittest.TestCase):
             tmux.list_sessions.return_value = []
             tmux.get_pane_title.return_value = None
 
-            with patch.dict(os.environ, {"DEV": str(dev)}):
+            with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev)}):
                 menu = SessionMenu(tmux)
                 with patch.object(menu, "_get_all_projects", return_value=[("Banksy", 1), ("Blog", 1)]), patch.object(
                     menu, "_active_runner_projects", return_value=set()

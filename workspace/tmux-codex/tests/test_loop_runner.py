@@ -92,7 +92,7 @@ class LoopScriptTests(unittest.TestCase):
         self.assertTrue(str(paths.active_lock).endswith("/Repos/blog/.memory/RUNNER_ACTIVE.lock"))
         self.assertTrue(str(paths.state_file).endswith("/Repos/blog/.memory/runner/RUNNER_STATE.json"))
         self.assertTrue(str(paths.audit_file).endswith("/Repos/blog/.memory/runner/RUNNER_LEDGER.ndjson"))
-        self.assertTrue(str(paths.runner_log).endswith("/workspace/codex/logs/runners/runner-blog.log"))
+        self.assertTrue(str(paths.runner_log).endswith("/.codex/logs/runners/runner-blog.log"))
 
     def test_script_runs_interactive_runner_chat(self):
         with patch("src.runner_loop.resolve_target_project_root", return_value=Path("/Users/jian/Dev/Repos/blog")):
@@ -166,11 +166,12 @@ class LoopPromptTests(unittest.TestCase):
 class LoopLoggingTests(unittest.TestCase):
     def test_log_line_keeps_console_output_unstamped(self):
         with tempfile.TemporaryDirectory() as tmp:
-            paths = build_runner_state_paths(tmp, "blog", "main")
             message = "Iteration 1 running gpt-5.3-codex"
 
-            with patch("builtins.print") as mocked_print:
-                _log_line(paths, message)
+            with patch.dict("os.environ", {"HOME": tmp}):
+                paths = build_runner_state_paths(tmp, "blog", "main")
+                with patch("builtins.print") as mocked_print:
+                    _log_line(paths, message)
 
             mocked_print.assert_called_once_with(message, flush=True)
             log_line = paths.runner_log.read_text().strip()

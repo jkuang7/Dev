@@ -3,24 +3,24 @@
 # SETUP
 # -----
 # Both Mac Mini and MacBook now use ~/Dev
-# .zshrc sources: $HOME/Dev/workspace/.custom
+# .zshrc sources: $HOME/Dev/.custom
 
 #=======================================
 # Shell Configuration
 #=======================================
 _this="${(%):-%x}"
 [[ -z "$_this" ]] && _this="$0"
-export WORKSPACE_HOME="$(cd "$(dirname "$_this")" && pwd)"
-export DEV="$(cd "$WORKSPACE_HOME/.." && pwd)"
-export CODEX_HOME="$WORKSPACE_HOME/codex"
+export DEV="$(cd "$(dirname "$_this")" && pwd)"
+export WORKSPACE_HOME="$DEV/workspace"
+export CODEX_HOME="$HOME/.codex"
 unset _this
 export REPOS_HOME="$DEV/Repos"
 
 alias cdd='cd $DEV'
 alias ze="code ~/.zshrc"
 alias zs='source ~/.zprofile && source ~/.zshrc'
-alias ce='code "$WORKSPACE_HOME/.custom"'
-alias cs='source "$WORKSPACE_HOME/.custom"'
+alias ce='code "$DEV/.custom"'
+alias cs='source "$DEV/.custom"'
 
 # Intrinsic Value calculator
 alias iv='(cd $DEV/Repos/stonks && .venv/bin/python3 iv.py)'
@@ -54,7 +54,9 @@ alias sshjk='ssh -t jian@Mac-mini "cd ~/Dev && clear && exec zsh -l"'
 #=======================================
 # Codex shortcuts
 #=======================================
-alias oc='codex'
+codex() {
+    command codex --yolo "$@"
+}
 
 # Avoid alias/function name conflict when this file is re-sourced.
 unalias ol 2>/dev/null

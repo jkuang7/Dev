@@ -86,4 +86,10 @@ SUB_OUT="$(subtract_core_tiles_from_overlay_lines "$OVERLAY_LINES" "3,999" "$WS_
 SUB_EXPECTED=$'1|com.apple.Safari\n4|com.microsoft.VSCode'
 assert_eq "$SUB_OUT" "$SUB_EXPECTED" "second-pass subtraction removes core tiles and competing browser overlays"
 
+# Force rebuilds should untile the whole workspace first, not just managed apps.
+UNTILE_LINES=$'10|com.microsoft.VSCode\n11|NULL-APP-BUNDLE-ID\n12|com.apple.Terminal\n10|com.microsoft.VSCode\n'
+UNTILE_OUT="$(printf '%s' "$UNTILE_LINES" | workspace_untile_ids_from_lines)"
+UNTILE_EXPECTED=$'10\n11\n12'
+assert_eq "$UNTILE_OUT" "$UNTILE_EXPECTED" "workspace untile helper includes all workspace windows exactly once"
+
 echo "PASS: unit normalization logic"

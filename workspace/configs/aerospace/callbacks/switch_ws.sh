@@ -73,6 +73,6 @@ if [[ "$STATE_UPNOTE_TILED" == "true" ]]; then
     fi
 fi
 
-rebuild_workspace "$TARGET_WS"
+rebuild_workspace "$TARGET_WS" force
 
 log "switch_ws $TARGET_WS complete"

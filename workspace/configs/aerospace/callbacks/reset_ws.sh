@@ -33,6 +33,9 @@ if [[ ${#UPNOTE_WIDS[@]} -eq 0 ]]; then
     get_home_windows
 fi
 
+# Rebuild from a clean workspace envelope.
+converge_all_windows_to_workspace "$WS"
+
 # Rebuild with default state (force to fix column order)
 rebuild_workspace "$WS" force
 

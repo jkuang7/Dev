@@ -29,7 +29,7 @@ LESSONS LEARNED (for debugging tmux-codex):
    - tmux capture-pane -t runner-<project> -p | tail -20  # See runner state
    - ps aux | grep "watchdog.*runner"                      # Check watchdog running
    - cat /tmp/watchdog-runner-<project>.log               # Watchdog logs
-   - cat workspace/codex/logs/runners/runners.log        # Timer data
+   - cat ~/.codex/logs/runners/runners.log               # Timer data
 """
 
 import curses

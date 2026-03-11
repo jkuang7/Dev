@@ -3,7 +3,7 @@ set -euo pipefail
 
 AEROSPACE_FIX="/Users/jian/Dev/workspace/configs/aerospace/fullscreen_fix.sh"
 SYMLINK_FIX="/Users/jian/.config/aerospace/fullscreen_fix.sh"
-REPO_HS_CONFIG="/Users/jian/Dev/workspace/codex/config/hammerspoon/init.lua"
+REPO_HS_CONFIG="/Users/jian/.codex/config/hammerspoon/init.lua"
 SETUP_SCRIPT="/Users/jian/Dev/workspace/scripts/setup-aerospace.sh"
 fail() {
     echo "FAIL: $1"

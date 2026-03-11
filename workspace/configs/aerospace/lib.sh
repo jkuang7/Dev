@@ -371,16 +371,10 @@ converge_all_windows_to_workspace() {
 
     [[ -z "$target_ws" ]] && return 0
 
-    # Only converge managed home apps. Moving all app windows causes
-    # cross-workspace churn for unrelated apps and destabilizes layout.
     windows=$(aerospace list-windows --all --format '%{window-id}|%{workspace}|%{app-bundle-id}' 2>/dev/null || true)
 
     while IFS='|' read -r wid ws bundle; do
-        [[ -z "$wid" || -z "$ws" || -z "$bundle" ]] && continue
-        case "$bundle" in
-            "$VSCODE"|"$CODEX"|"$ZEN"|"$SAFARI"|"$UPNOTE") ;;
-            *) continue ;;
-        esac
+        [[ -z "$wid" || -z "$ws" ]] && continue
         if [[ "$ws" != "$target_ws" ]]; then
             aerospace move-node-to-workspace --window-id "$wid" "$target_ws" 2>/dev/null || true
             moved=$((moved + 1))
@@ -390,6 +384,30 @@ converge_all_windows_to_workspace() {
     if [[ $moved -gt 0 ]]; then
         log "converge: moved $moved window(s) to workspace $target_ws"
     fi
+}
+
+workspace_untile_ids_from_lines() {
+    awk -F'|' '
+        {
+            wid=$1
+            if (wid ~ /^[0-9]+$/ && !(wid in seen)) {
+                seen[wid]=1
+                print wid
+            }
+        }
+    '
+}
+
+untile_workspace_windows() {
+    local ws="$1"
+    local wid
+
+    aerospace list-windows --workspace "$ws" --format '%{window-id}|%{app-bundle-id}' 2>/dev/null \
+        | workspace_untile_ids_from_lines \
+        | while IFS= read -r wid; do
+            [[ -z "$wid" ]] && continue
+            aerospace layout --window-id "$wid" floating 2>/dev/null || true
+        done
 }
 
 # Get all home app window IDs
@@ -964,31 +982,8 @@ rebuild_workspace() {
     if [[ "$needs_rebuild" == "true" ]]; then
         log "full rebuild - untile then retile by precedence"
 
-        # Untile everything in the managed object first (all core apps + all
-        # browser bundles in this workspace), then retile one-by-one.
-        local -a untile_wids
-        untile_wids=()
-        local wid existing skip
-        while IFS='|' read -r wid bundle; do
-            [[ -z "$wid" || -z "$bundle" ]] && continue
-            case "$bundle" in
-                "$VSCODE"|"$CODEX"|"$UPNOTE"|"$ZEN"|"$SAFARI"|"com.google.Chrome"|"company.thebrowser.Browser"|"com.brave.Browser"|"org.mozilla.firefox")
-                    skip="false"
-                    for existing in "${untile_wids[@]-}"; do
-                        if [[ "$existing" == "$wid" ]]; then
-                            skip="true"
-                            break
-                        fi
-                    done
-                    if [[ "$skip" == "false" ]]; then
-                        untile_wids+=("$wid")
-                    fi
-                    ;;
-            esac
-        done < <(aerospace list-windows --workspace "$ws" --format '%{window-id}|%{app-bundle-id}' 2>/dev/null || true)
-        for wid in "${untile_wids[@]-}"; do
-            aerospace layout --window-id "$wid" floating 2>/dev/null || true
-        done
+        # Reset the entire workspace before reconstructing the core layout.
+        untile_workspace_windows "$ws"
 
         # Retile one-by-one in strict left-to-right precedence.
         # Precedence: UpNote -> VSCode -> Codex -> Browser
