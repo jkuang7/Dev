@@ -1,6 +1,9 @@
 {
   "git.decorations.enabled": true,
   "scm.defaultViewMode": "tree",
+  "files.exclude": {
+    ".DS_Store": true
+  },
   "workbench.colorCustomizations": {
     "gitDecoration.ignoredResourceForeground": "#cccccc"
   },

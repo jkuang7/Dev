@@ -1,0 +1,10 @@
+# User workspace - reset on each practice
+workspace/*
+!workspace/.gitkeep
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store

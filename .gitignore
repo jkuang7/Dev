@@ -4,49 +4,22 @@
 # let git traverse folders
 !*/
 
-# unignore one exact file at repo root
+# root control files
 !/AGENTS.md
-!/.custom
-!/repos.txt
-
-!/configs/
-!/configs/**
-
-!/hooks/
-!/hooks/**
-
-# unignore one exact directory and everything inside it
-!/scripts/
-!/scripts/**
-
 !/.vscode/
 !/.vscode/**
+!/workspace/
+!/workspace/**
 
-!/.githooks/
-!/.githooks/**
-
-!/tmux-codex/
-!/tmux-codex/**
-
-/.archive/
-/.archive/**
-/.codex/
-/.codex/**
-/.opencode/
-/.opencode/**
-/Repos/
+# nested repo container stays visible, but its contents are owned by nested repos
+!/Repos/
 /Repos/**
-/helix-work/
-/helix-work/**
-/landing-pages/
-/landing-pages/**
-/Career/
-/Career/**
-/ASPIDA/
-/ASPIDA/**
-/.playwright-mcp/
-/.playwright-mcp/**
 /worktrees/
 /worktrees/**
-/current*.txt
-/configs/aerospace/engine/node_modules/
+
+# runtime and generated content
+/.DS_Store
+/workspace/configs/aerospace/engine/node_modules/
+/workspace/tmux-codex/.pytest_cache/
+/workspace/tmux-codex/**/__pycache__/
+/workspace/tmux-codex/**/*.pyc
