@@ -44,12 +44,24 @@ Rules:
 - do not do setup/clear behavior here
 - do not expand into broad preflight unless closeout truly requires it
 - do not treat read-only inspection or prompt restatement as completed work
+- do not advance just because code changed, one test passed, or the result feels closer
+- treat the current `TT-*` as the stable unit of ownership; medium slices are execution chunks, not reasons to advance to a different task
+- keep the active task open until its acceptance criteria are actually satisfied
+- stay on the same `TT-*` across cycles by default while acceptance remains unmet, even when the next slice attacks a narrower sub-problem on that same task
+- if the current task is actually complete, update `TASKS.json` first so the task is marked done before handoff
+- if you fully completed a task in this slice, include its canonical task id in the structured runner update
 - if no concrete progress happened, update `TASKS.json` first to narrow the blocker before handoff
 - if the same `phase / next_task_id / blocker state` would survive unchanged, rewrite it to the exact failing surface or mark it blocked
+- if the active task still has a known blocker after validation, keep the same task active and rewrite the blocker more precisely
+- if new in-scope acceptance criteria are discovered while working the task, strengthen the same task's acceptance or validation contract before handoff instead of leaving the requirement implicit
+- only create or switch to a different `TT-*` when the remaining work is genuinely independent of the active task's acceptance target or when one umbrella task must be split into explicit bounded blockers
+- do not move to a different task while the current task's acceptance is still unmet
+- for any task, passing tests alone is not enough when the stated acceptance still requires behavior, UX, completeness, or polish evidence
 - if the active task acceptance mentions parity, baseline matching, or restoring prior behavior/styling, treat that as fail-closed: do not claim completion on approximate similarity
 - for parity-style tasks, require an explicit comparison against the recorded baseline; if any known delta remains, keep the task open and name the exact remaining surface/blocker
 - do not use `phase_done=yes` for a parity-style task unless the current slice actually cleared the recorded parity delta for the audited surface
 - never mark a parity/regression-restoration task complete just because tests pass; tests are necessary but not sufficient when acceptance requires baseline matching
+- for subjective polish or UX tasks, require direct evidence on the touched surface; if rough edges remain, keep going on the same task
 
 ## Handoff
 
@@ -57,6 +69,8 @@ Do not refresh runner state from this prompt.
 
 When the bounded work slice is done:
 - stop after one coherent work surface
+- review your work by asking: `Any problems with the current implementation?`
+- name every real remaining issue, regression, rough edge, or acceptance gap explicitly
 - report compact operational output
 - terminate this Codex chat session immediately
 

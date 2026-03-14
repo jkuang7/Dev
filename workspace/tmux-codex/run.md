@@ -102,11 +102,14 @@ Clear requirements:
 - read `RUNNER_EXEC_CONTEXT.json`
 - resolve phase from explicit `PHASE` or exec context
 - work only within the current phase goal and one coherent medium slice
+- treat medium slices as execution chunks while keeping the same active `TT-*` until its acceptance is fully satisfied
+- strengthen the active task contract when new in-scope acceptance criteria are discovered instead of silently carrying hidden requirements
 - avoid setup/clear behavior
 - terminate immediately
 
 `/prompts:run_update` must:
 - refresh runner state with quiet setup
+- preserve the same active `TT-*` on partial progress and only advance when acceptance is actually cleared or the task must be split into explicit independent blockers
 - write `.memory/runner/runtime/RUNNER_CYCLE_PREPARED.json`
 - terminate immediately
 

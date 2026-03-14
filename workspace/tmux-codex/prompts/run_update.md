@@ -22,15 +22,26 @@ Resolve target root in this order:
 Refresh runner memory once:
 
 ```bash
-python3 /Users/jian/Dev/workspace/tmux-codex/bin/runctl --setup --quiet --project-root <target_root> --runner-id main
+python3 /Users/jian/Dev/workspace/tmux-codex/bin/runctl --refresh --quiet --project-root <target_root> --runner-id main
 ```
 
 Strictness rules during refresh:
 
 - preserve or strengthen the active task acceptance/validation contract; never relax it
+- preserve the active `TT-*` by default until its acceptance is fully cleared; medium slices do not justify task churn on their own
+- keep the current task active when its acceptance criteria are still unmet; do not advance on partial progress
+- if the execute slice narrowed the blocker but did not clear it, carry forward the same task with the narrower blocker
+- if execution discovered new in-scope acceptance criteria or validation needs, merge them into the same active task so the contract gets stronger instead of silently drifting
+- do not spin off a new task for newly discovered acceptance criteria unless the work is truly independent of the current task's acceptance target
+- preserve explicit, self-contained problem descriptions in the objective, task title, acceptance, validation, and `next_task`; never rewrite them into shorthand that depends on prior chat context
+- if the remaining blocker changed, rewrite it as the exact remaining problem on the exact surface instead of using implicit phrases like `continue`, `fix remaining issue`, `fonts`, `polish`, or `same bug`
+- never assume screenshots or earlier turns will be available to the next runner; refreshed wording must stand on its own
+- do not let refresh rewrite a fail-closed task into approximate wording like `closer`, `looks better`, or `mostly done`
+- for subjective polish, UX, or completeness work, keep direct-evidence requirements in place
 - if the active objective/task is parity, regression-restoration, or baseline-matching work, the refreshed state must remain fail-closed
 - do not refresh vague wording such as `looks right` or `matches old styling`; keep explicit baseline-comparison and no-known-delta criteria in place
 - if the execute slice did not fully clear the parity delta, keep the task open and carry forward the exact remaining blocker
+- if the same `TT-*` survives multiple cycles, keep tightening the blocker or split it into a few explicit dependent tasks; do not leave the task as a vague XL umbrella
 
 Write prepared marker:
 
@@ -44,5 +55,8 @@ Keep output compact:
 - `state_refreshed=<yes|no>`
 - `prepared_marker=<yes|no>`
 - `exiting=<yes>`
+
+Before terminating this chat, emit this directive on its own line so the current runner thread is archived before the supervisor relaunches a fresh session:
+- `::archive{reason="Runner cycle complete; restarting fresh"}`
 
 Terminate this Codex chat session immediately after the update commands finish.
