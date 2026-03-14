@@ -36,10 +36,129 @@ from .runner_state import (
 TASK_STATUS_VALUES = {"open", "in_progress", "blocked", "done"}
 TASK_PRIORITY_ORDER = {"p0": 0, "p1": 1, "p2": 2, "p3": 3}
 SETUP_EVENT_COALESCE_SECONDS = 90
+RUNNER_PROMPT_NAMES = ("run_setup", "run_execute", "run_update", "add")
 
 
 def _default_dev() -> str:
     return str(Path.home() / "Dev")
+
+
+def _repo_home() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _prompt_source_dir() -> Path:
+    return _repo_home() / "prompts"
+
+
+def _prompt_install_dir() -> Path:
+    return Path.home() / ".codex" / "prompts"
+
+
+def _validate_runner_prompt_install() -> str | None:
+    source_dir = _prompt_source_dir()
+    install_dir = _prompt_install_dir()
+    install_cmd = f"bash {(_repo_home() / 'scripts' / 'install-codex-run-prompt.sh')}"
+
+    for prompt_name in RUNNER_PROMPT_NAMES:
+        source = source_dir / f"{prompt_name}.md"
+        installed = install_dir / f"{prompt_name}.md"
+        if not source.exists():
+            return f"Canonical runner prompt missing: {source}"
+        if not installed.exists():
+            return (
+                f"Installed runner prompt missing: {installed}. "
+                f"Reinstall runner prompts with `{install_cmd}`."
+            )
+        if not installed.is_symlink():
+            return (
+                f"Installed runner prompt is not linked to canonical source: {installed}. "
+                f"Reinstall runner prompts with `{install_cmd}`."
+            )
+        try:
+            resolved = installed.resolve(strict=True)
+        except OSError:
+            return (
+                f"Installed runner prompt link is broken: {installed}. "
+                f"Reinstall runner prompts with `{install_cmd}`."
+            )
+        if resolved != source.resolve():
+            return (
+                f"Installed runner prompt points at the wrong source: {installed} -> {resolved}. "
+                f"Reinstall runner prompts with `{install_cmd}`."
+            )
+    return None
+
+
+def _repair_runner_prompt_install() -> str | None:
+    script = _repo_home() / "scripts" / "install-codex-run-prompt.sh"
+    install_cmd = f"bash {script}"
+    try:
+        completed = subprocess.run(
+            ["bash", str(script)],
+            cwd=str(_repo_home()),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return f"Runner prompt auto-install failed while running `{install_cmd}`: {exc}"
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        if detail:
+            return f"Runner prompt auto-install failed while running `{install_cmd}`: {detail}"
+        return f"Runner prompt auto-install failed while running `{install_cmd}` with exit code {exc.returncode}."
+
+    validation_error = _validate_runner_prompt_install()
+    if validation_error:
+        output = (completed.stdout or "").strip()
+        if output:
+            return f"{validation_error} Auto-install output: {output}"
+        return validation_error
+    return None
+
+
+def _ensure_runner_prompt_install() -> str | None:
+    validation_error = _validate_runner_prompt_install()
+    if validation_error is None:
+        return None
+    if validation_error.startswith("Canonical runner prompt missing:"):
+        return validation_error
+    return _repair_runner_prompt_install()
+
+
+def ensure_runner_prompt_install() -> str | None:
+    """Validate installed runner prompts and auto-repair symlink drift when possible."""
+    return _ensure_runner_prompt_install()
+
+
+def _read_lock_metadata(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    metadata: dict[str, str] = {}
+    for line in raw.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key_text = key.strip()
+        value_text = value.strip()
+        if key_text and value_text:
+            metadata[key_text] = value_text
+    return metadata
+
+
+def _normalize_project_root_path(path: str | Path) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    if resolved.name == ".memory":
+        return resolved.parent
+    for parent in resolved.parents:
+        if parent.name == ".memory":
+            return parent.parent
+    return resolved
 
 
 def _resolve_project_context(
@@ -1938,6 +2057,39 @@ def _inspect_runner_start_state(
                 "Runner is not enabled. Run /prompts:run_setup and approve enablement before starting."
                 f"{token_hint}"
             ),
+            "project": project,
+            "runner_id": runner_id,
+            "project_root": str(resolved_root),
+        }
+
+    if paths.stop_lock.exists():
+        stop_meta = _read_lock_metadata(paths.stop_lock)
+        source = _as_text(stop_meta.get("source"))
+        if source == "runner_no_progress":
+            error_text = (
+                "Runner is paused because the last cycle made no durable progress. "
+                "Run /prompts:run_setup again after narrowing the blocker before starting."
+            )
+        else:
+            error_text = (
+                "Runner stop lock is present. Clear the stop condition with /prompts:run_setup before starting."
+            )
+        reason = _as_text(stop_meta.get("reason"))
+        if reason:
+            error_text = f"{error_text} Reason: {reason}."
+        return {
+            "ok": False,
+            "error": error_text,
+            "project": project,
+            "runner_id": runner_id,
+            "project_root": str(resolved_root),
+        }
+
+    prompt_error = _ensure_runner_prompt_install()
+    if prompt_error:
+        return {
+            "ok": False,
+            "error": prompt_error,
             "project": project,
             "runner_id": runner_id,
             "project_root": str(resolved_root),

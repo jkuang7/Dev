@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.runctl import clear_runner_state, create_runner_state, inspect_runner_start_state, parse_args, run
+from src.runctl import RUNNER_PROMPT_NAMES, clear_runner_state, create_runner_state, inspect_runner_start_state, parse_args, run
 from src.runner_state import build_runner_state_paths, build_runner_state_paths_for_root, compute_worktree_fingerprint, read_json, write_json
 
 
@@ -114,6 +114,107 @@ class RunctlTests(unittest.TestCase):
         result = inspect_runner_start_state(str(self.dev), "blog", "main")
         self.assertTrue(result["ok"])
         self.assertEqual(result["next_task_id"], "TT-001")
+
+    def test_inspect_runner_start_state_auto_repairs_runner_prompt_install_drift(self):
+        initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        token = initial["enable_token"]
+        approved = create_runner_state(str(self.dev), "blog", "main", approve_enable=token)
+        self.assertTrue(approved["ok"])
+
+        with patch(
+            "src.runctl._validate_runner_prompt_install",
+            side_effect=[
+                "Installed runner prompt is not linked to canonical source.",
+                None,
+            ],
+        ), patch("src.runctl._repair_runner_prompt_install", return_value=None) as repair_prompt_install:
+            result = inspect_runner_start_state(str(self.dev), "blog", "main")
+
+        self.assertTrue(result["ok"])
+        repair_prompt_install.assert_called_once()
+
+    def test_inspect_runner_start_state_fails_when_runner_prompt_auto_repair_does_not_fix_drift(self):
+        initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        token = initial["enable_token"]
+        approved = create_runner_state(str(self.dev), "blog", "main", approve_enable=token)
+        self.assertTrue(approved["ok"])
+
+        with patch(
+            "src.runctl._validate_runner_prompt_install",
+            return_value="Installed runner prompt is not linked to canonical source.",
+        ), patch(
+            "src.runctl._repair_runner_prompt_install",
+            return_value="Installed runner prompt is not linked to canonical source.",
+        ):
+            result = inspect_runner_start_state(str(self.dev), "blog", "main")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("not linked to canonical source", result["error"])
+
+    def test_inspect_runner_start_state_does_not_attempt_runner_prompt_auto_repair_when_canonical_prompt_missing(self):
+        initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        token = initial["enable_token"]
+        approved = create_runner_state(str(self.dev), "blog", "main", approve_enable=token)
+        self.assertTrue(approved["ok"])
+
+        with patch(
+            "src.runctl._validate_runner_prompt_install",
+            return_value="Canonical runner prompt missing: /tmp/run_execute.md",
+        ), patch("src.runctl._repair_runner_prompt_install") as repair_prompt_install:
+            result = inspect_runner_start_state(str(self.dev), "blog", "main")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Canonical runner prompt missing", result["error"])
+        repair_prompt_install.assert_not_called()
+
+    def test_runner_prompt_validation_covers_all_canonical_runner_prompts(self):
+        self.assertEqual(set(RUNNER_PROMPT_NAMES), {"run_setup", "run_execute", "run_update", "add"})
+
+    def test_inspect_runner_start_state_blocks_when_stop_lock_is_present(self):
+        initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        token = initial["enable_token"]
+        approved = create_runner_state(str(self.dev), "blog", "main", approve_enable=token)
+        self.assertTrue(approved["ok"])
+
+        paths = self._paths()
+        paths.stop_lock.write_text(
+            "requested_at=2026-03-14T00:00:00Z\n"
+            "source=runner_no_progress\n"
+            "reason=no_durable_progress_since_cycle_baseline\n",
+            encoding="utf-8",
+        )
+
+        result = inspect_runner_start_state(str(self.dev), "blog", "main")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("no durable progress", result["error"])
+        self.assertIn("no_durable_progress_since_cycle_baseline", result["error"])
+
+    def test_inspect_runner_start_state_rejects_blocked_next_task(self):
+        initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        token = initial["enable_token"]
+        approved = create_runner_state(str(self.dev), "blog", "main", approve_enable=token)
+        self.assertTrue(approved["ok"])
+
+        paths = self._paths()
+        tasks_payload = read_json(paths.tasks_json)
+        state = read_json(paths.state_file)
+        self.assertIsNotNone(tasks_payload)
+        self.assertIsNotNone(state)
+        assert tasks_payload is not None
+        assert state is not None
+        tasks_payload["tasks"][0]["status"] = "blocked"
+        tasks_payload["tasks"][0]["blocked_reason"] = "branch_enforcement_failed: expected main"
+        write_json(paths.tasks_json, tasks_payload)
+        state["next_task_id"] = tasks_payload["tasks"][0]["task_id"]
+        state["next_task"] = tasks_payload["tasks"][0]["title"]
+        write_json(paths.state_file, state)
+
+        result = inspect_runner_start_state(str(self.dev), "blog", "main")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("is blocked", result["error"])
+        self.assertIn("branch_enforcement_failed: expected main", result["error"])
 
     def test_inspect_runner_start_state_repairs_stale_done_next_task(self):
         initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)

@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from .menu import SessionMenu
-from .runctl import inspect_runner_start_state, resolve_target_project_root
+from .runctl import ensure_runner_prompt_install, inspect_runner_start_state, resolve_target_project_root
 from .runner_loop import (
     build_runner_paths,
     ensure_gates_file,
@@ -60,6 +60,12 @@ def detect_session_type(args: list[str]) -> tuple[str, str]:
 
 def create_session(args: list[str]) -> None:
     """Create new Codex session and attach."""
+    prompt_error = ensure_runner_prompt_install()
+    if prompt_error:
+        print("Prompt install check failed")
+        print(f"Error: {prompt_error}")
+        return
+
     config = get_tmux_config()
     tmux = TmuxClient(config=config)
 
