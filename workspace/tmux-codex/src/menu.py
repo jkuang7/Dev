@@ -42,6 +42,7 @@ from .runner_loop import (
     build_runner_paths,
     ensure_gates_file,
     make_codex_exec_loop_script,
+    resolve_active_task_execution_profile,
     resolve_runner_profile,
 )
 from .runner_status import detect_runner_state
@@ -133,6 +134,22 @@ class SessionMenu:
     def _persist_runner_picker_state(self, enabled: set[str], complexity: str) -> None:
         """Persist in-progress picker state so manual toggles survive reopening the menu."""
         self._save_runner_prefs(set(enabled), complexity)
+
+    def _selectable_runner_projects(self, projects: list[tuple[str, int]], active_projects: set[str]) -> set[str]:
+        """Return projects that can be toggled in the runner picker."""
+        return {name for name, _ in projects if name not in active_projects}
+
+    def _toggle_all_runner_projects(
+        self,
+        enabled: set[str],
+        projects: list[tuple[str, int]],
+        active_projects: set[str],
+    ) -> set[str]:
+        """Toggle all selectable projects on or off."""
+        selectable = self._selectable_runner_projects(projects, active_projects)
+        if enabled == selectable:
+            return set()
+        return selectable
 
     def _get_tags_path(self) -> Path:
         """Get path to session tags file."""
@@ -779,7 +796,7 @@ class SessionMenu:
                 stdscr,
                 row,
                 2,
-                "Space=toggle | a=all | n=none | Enter=start | Esc=cancel (locked=running)",
+                "Space=toggle | a=all/none | n=none | Enter=start | Esc=cancel (locked=running)",
                 curses.A_DIM,
             )
 
@@ -811,7 +828,7 @@ class SessionMenu:
                     enabled.add(name)
                 self._persist_runner_picker_state(enabled, complexity)
             elif key == ord('a') or key == ord('A'):  # Select all
-                enabled = {name for name, _ in projects if name not in active_projects}
+                enabled = self._toggle_all_runner_projects(enabled, projects, active_projects)
                 self._persist_runner_picker_state(enabled, complexity)
             elif key == ord('n') or key == ord('N'):  # Select none
                 enabled.clear()
@@ -868,7 +885,7 @@ class SessionMenu:
                 marker = ">" if idx == cursor else " "
                 print(f"{marker} {idx + 1}) {checkbox} {name:<20} {count_str}")
 
-            print("\n  ↑/↓ move | Space=toggle | a=all | n=none | Enter=start | q=cancel (locked=running)")
+            print("\n  ↑/↓ move | Space=toggle | a=all/none | n=none | Enter=start | q=cancel (locked=running)")
 
             try:
                 choice = self._read_fallback_project_selector_input()
@@ -896,7 +913,7 @@ class SessionMenu:
                     enabled.add(name)
                 self._persist_runner_picker_state(enabled, complexity)
             elif choice == 'a':
-                enabled = {name for name, _ in projects if name not in active_projects}
+                enabled = self._toggle_all_runner_projects(enabled, projects, active_projects)
                 self._persist_runner_picker_state(enabled, complexity)
             elif choice == 'n':
                 enabled.clear()
@@ -1026,6 +1043,11 @@ class SessionMenu:
                 runner_id=runner_id,
                 project_root=project_root,
             )
+            active_profile = resolve_active_task_execution_profile(
+                paths=paths.state,
+                fallback_model=model,
+                fallback_reasoning_effort=reasoning_effort,
+            )
             cmd = make_codex_exec_loop_script(
                 dev=dev,
                 project=project,
@@ -1041,7 +1063,13 @@ class SessionMenu:
                 print(f"  Failed to create runner {sess_name}: {e}")
                 continue
 
-            print(f"  Started {sess_name} ({complexity}, {model}, effort={reasoning_effort})")
+            display_profile = str(active_profile.get("model_profile") or complexity)
+            display_model = str(active_profile.get("model") or model)
+            display_effort = str(active_profile.get("reasoning_effort") or reasoning_effort)
+            display_task_id = str(active_profile.get("task_id") or "").strip()
+            print(f"  Started {sess_name} ({display_profile}, {display_model}, effort={display_effort})")
+            if display_task_id:
+                print(f"    active task: {display_task_id}")
             state_paths = getattr(paths, "state", None)
             state_file_path = getattr(state_paths, "state_file", None)
             state_data = read_json(state_file_path) if state_file_path is not None else {}

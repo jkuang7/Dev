@@ -6,7 +6,8 @@ The runner control plane is fully decoupled into three prompts:
 2. `/prompts:run_execute`
 3. `/prompts:run_update`
 
-`cl -> r=runner` must use only `/prompts:run_execute` followed by `/prompts:run_update` internally.
+`cl -> r=runner` must always start with `/prompts:run_execute`.
+It should only dispatch `/prompts:run_update` in a fresh session when execute explicitly requests semantic task-state changes.
 
 ## Minimal User Flow
 
@@ -36,9 +37,9 @@ Runner start is intentionally decoupled:
   - validate the active surface
   - terminate the session
 - `/prompts:run_update`
-  - post-execute refresh prompt
-  - quiet setup refresh
-  - writes the prepared marker
+  - semantic post-execute update prompt
+  - used only when execute reported task-state changes that need modeled rewriting
+  - refreshes runner state and writes the prepared marker in its own fresh session
   - terminate the session
 
 Deprecated:
@@ -82,6 +83,8 @@ Setup requirements:
 - if `PRD.json` / `TASKS.json` are missing, generic, or stale for the current request, seed fresh concrete files before running setup
 - use the latest explicit user request as the source of truth for the seeded objective and bounded tasks
 - seeded tasks must be narrow enough for one bounded runner slice; do not seed umbrella tasks when the request already names smaller concrete surfaces
+- for dependency-heavy migrations, `run_setup` is the strong planning gate: it should split work by file family, safe deprecation phase, and dependency containment before the infinite runner starts
+- seeded active tasks should carry `model_profile`, `profile_reason`, `touch_paths`, `validation_commands`, `deprecation_phase`, `fanout_risk`, and optional `spillover_paths`
 - refresh `.memory/runner/*`
 - refresh `RUNNER_EXEC_CONTEXT.json`
 - keep `next_task_id` and `next_task` aligned with `TASKS.json`
@@ -95,7 +98,8 @@ Clear requirements:
 
 ## Execute Contract
 
-`/prompts:run_execute` and `/prompts:run_update` are the only prompts `r=runner` should drive.
+`/prompts:run_execute` is the default prompt `r=runner` should drive each cycle.
+`/prompts:run_update` is conditional and should run only when semantic refresh is required.
 
 `/prompts:run_execute` must:
 - read `.memory/runner/runtime/RUNNER_STATE.json`
@@ -122,9 +126,13 @@ Fail-closed rules:
 
 `cl -> r=runner` and `cl loop <project>`:
 - start an interactive Codex CLI pane
+- resolve the active task profile at the start of each cycle
+- route `model_profile=mini` to the cheaper execution model and `model_profile=high` to `gpt-5.4` with `high`
 - launch an internal controller per cycle
-- controller dispatches `/prompts:run_execute ...` and then `/prompts:run_update ...`
-- after update, controller exits the current Codex session so a fresh TUI session is launched for the next cycle
+- controller dispatches `/prompts:run_execute ...` first
+- after execute, controller scripts deterministic refresh itself with `runctl --setup` and `runctl --prepare-cycle` when no semantic update is needed
+- when execute reports `needs_update=yes`, controller exits the current Codex session and relaunches a fresh session for `/prompts:run_update ...`
+- after scripted refresh or conditional update, controller exits the current Codex session so a fresh TUI session is launched for the next cycle
 - controller never dispatches setup or clear
 
 ## Prompt Install Contract

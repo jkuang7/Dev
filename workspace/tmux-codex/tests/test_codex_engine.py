@@ -47,7 +47,7 @@ class CodexEngineTests(unittest.TestCase):
         called_cmd = popen.call_args.args[0]
         self.assertEqual(called_cmd[:7], ["codex", "--search", "-s", "workspace-write", "exec", "--json", "-m"])
         self.assertIn("-c", called_cmd)
-        self.assertIn('reasoning.effort="high"', called_cmd)
+        self.assertIn('model_reasoning_effort="high"', called_cmd)
 
     def test_resume_command_uses_session_id(self):
         lines = ['{"type":"item.completed","item":{"type":"message","text":"ok"}}\n']
@@ -63,7 +63,7 @@ class CodexEngineTests(unittest.TestCase):
         called_cmd = popen.call_args.args[0]
         self.assertEqual(called_cmd[:6], ["codex", "--search", "-s", "workspace-write", "exec", "resume"])
         self.assertIn("thread-xyz", called_cmd)
-        self.assertIn('reasoning.effort="high"', called_cmd)
+        self.assertIn('model_reasoning_effort="high"', called_cmd)
 
     def test_plain_stream_extracts_session_and_final_message(self):
         lines = [

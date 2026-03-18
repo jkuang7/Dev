@@ -41,6 +41,10 @@ COMPLEXITY_PROFILE_MAP = {
     "high": ("gpt-5.3-codex", "high"),
     "xhigh": ("gpt-5.3-codex", "xhigh"),
 }
+TASK_MODEL_PROFILE_MAP = {
+    "mini": ("gpt-5.4-mini", "medium"),
+    "high": ("gpt-5.4", "high"),
+}
 
 ProjectStack = Literal["pnpm", "npm", "python_pyproject", "python_requirements", "go", "cargo", "unknown"]
 RUNNER_UPDATE_START_MARKER = "RUNNER_UPDATE_START"
@@ -70,6 +74,7 @@ DONE_SIGNAL_FALSE_PATTERNS = (
 RUNNER_UPDATE_VISIBLE_HOLD_SECONDS = 1.2
 RUNNER_DISPATCH_IDLE_GRACE_SECONDS = 1.0
 RUNNER_COMPLETION_IDLE_GRACE_SECONDS = 1.0
+RUNNER_UPDATE_PENDING_PREFIX = "update_pending"
 
 
 @dataclass(frozen=True)
@@ -125,6 +130,189 @@ def resolve_runner_profile(complexity: str, model_override: str | None) -> tuple
     if model_override:
         return model_override, effort
     return mapped_model, effort
+
+
+def _normalize_task_model_profile(raw: object) -> str | None:
+    candidate = str(raw or "").strip().lower()
+    if candidate in TASK_MODEL_PROFILE_MAP:
+        return candidate
+    return None
+
+
+def _pending_update_profile_from_state(state: dict[str, object] | None) -> str | None:
+    if not isinstance(state, dict):
+        return None
+    current_step = str(state.get("current_step") or "").strip().lower()
+    if not current_step.startswith(RUNNER_UPDATE_PENDING_PREFIX):
+        return None
+    _, _, raw_profile = current_step.partition(":")
+    profile = _normalize_task_model_profile(raw_profile)
+    return profile or "mini"
+
+
+def _parse_status_directive(text: str, key: str) -> str | None:
+    pattern = re.compile(rf"^{re.escape(key)}=(.+)$", re.MULTILINE)
+    matches = pattern.findall(text)
+    if not matches:
+        return None
+    return matches[-1].strip().lower()
+
+
+def _parse_execute_update_request(text: str) -> dict[str, str | bool]:
+    needs_update = _parse_status_directive(text, "needs_update")
+    update_profile = _normalize_task_model_profile(_parse_status_directive(text, "update_profile"))
+    update_reason = _parse_status_directive(text, "update_reason")
+    requested = needs_update == "yes"
+    return {
+        "needs_update": requested,
+        "update_profile": update_profile or "mini",
+        "update_reason": update_reason or "",
+    }
+
+
+def _active_task_from_tasks_payload(paths: RunnerStatePaths, task_id: str | None) -> dict[str, object] | None:
+    payload = read_json(paths.tasks_json)
+    if not isinstance(payload, dict):
+        return None
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    normalized_task_id = str(task_id or "").strip()
+    if normalized_task_id:
+        for raw in tasks:
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("task_id", "")).strip() == normalized_task_id:
+                return raw
+    for raw in tasks:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("status", "")).strip().lower() in {"open", "in_progress", "blocked"}:
+            return raw
+    return None
+
+
+def resolve_active_task_execution_profile(
+    *,
+    paths: RunnerStatePaths,
+    fallback_model: str,
+    fallback_reasoning_effort: str,
+) -> dict[str, str | None]:
+    """Resolve the current task routing profile from exec-context/state with safe fallback."""
+    exec_context = read_json(paths.exec_context_json)
+    state = read_json(paths.state_file)
+    if not isinstance(exec_context, dict):
+        exec_context = {}
+    if not isinstance(state, dict):
+        state = {}
+
+    pending_update_profile = _pending_update_profile_from_state(state)
+
+    task_id = str(exec_context.get("task_id") or exec_context.get("next_task_id") or state.get("next_task_id") or "").strip()
+    task_title = str(exec_context.get("task_title") or exec_context.get("next_task") or state.get("next_task") or "").strip()
+    profile_reason = str(exec_context.get("profile_reason") or "").strip()
+    model_profile = _normalize_task_model_profile(exec_context.get("model_profile"))
+    profile_source = "exec_context"
+
+    if pending_update_profile:
+        model, reasoning_effort = TASK_MODEL_PROFILE_MAP[pending_update_profile]
+        return {
+            "model_profile": pending_update_profile,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "task_id": task_id or None,
+            "task_title": task_title or None,
+            "profile_reason": "Pending semantic run_update session after execute slice.",
+            "source": "pending_update",
+        }
+
+    task = None
+    if not model_profile or not task_title or not profile_reason:
+        task = _active_task_from_tasks_payload(paths, task_id or None)
+        if isinstance(task, dict):
+            task_id = task_id or str(task.get("task_id", "")).strip()
+            task_title = task_title or str(task.get("title", "")).strip()
+            profile_reason = profile_reason or str(task.get("profile_reason", "")).strip()
+            model_profile = model_profile or _normalize_task_model_profile(task.get("model_profile"))
+            profile_source = "tasks_json"
+
+    if model_profile:
+        model, reasoning_effort = TASK_MODEL_PROFILE_MAP[model_profile]
+        return {
+            "model_profile": model_profile,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "task_id": task_id or None,
+            "task_title": task_title or None,
+            "profile_reason": profile_reason or None,
+            "source": profile_source,
+        }
+
+    return {
+        "model_profile": None,
+        "model": fallback_model,
+        "reasoning_effort": fallback_reasoning_effort,
+        "task_id": task_id or None,
+        "task_title": task_title or None,
+        "profile_reason": profile_reason or None,
+        "source": "fallback",
+    }
+
+
+def _run_scripted_cycle_refresh(
+    *,
+    dev: str,
+    project: str,
+    runner_id: str,
+    project_root: Path,
+) -> tuple[bool, str | None]:
+    runctl_path = _repo_home() / "bin" / "runctl"
+    setup_cmd = [
+        "python3",
+        str(runctl_path),
+        "--setup",
+        "--quiet",
+        "--project-root",
+        str(project_root),
+        "--runner-id",
+        runner_id,
+    ]
+    prepare_cmd = [
+        "python3",
+        str(runctl_path),
+        "--prepare-cycle",
+        "--quiet",
+        "--project-root",
+        str(project_root),
+        "--runner-id",
+        runner_id,
+    ]
+    try:
+        setup_result = subprocess.run(setup_cmd, capture_output=True, text=True, check=False)
+        if setup_result.returncode != 0:
+            message = (setup_result.stderr or setup_result.stdout or "runctl --setup failed").strip()
+            return False, f"setup_failed:{message}"
+        prepare_result = subprocess.run(prepare_cmd, capture_output=True, text=True, check=False)
+        if prepare_result.returncode != 0:
+            message = (prepare_result.stderr or prepare_result.stdout or "runctl --prepare-cycle failed").strip()
+            return False, f"prepare_failed:{message}"
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return False, f"refresh_exception:{type(exc).__name__}: {exc}"
+    return True, None
+
+
+def render_runner_profile_shell_exports(profile: dict[str, str | None]) -> str:
+    """Render shell-safe assignments for per-cycle runner model selection."""
+    shell_vars = {
+        "RUNNER_MODEL": profile.get("model") or "",
+        "RUNNER_REASONING_EFFORT": profile.get("reasoning_effort") or "",
+        "RUNNER_MODEL_PROFILE": profile.get("model_profile") or "",
+        "RUNNER_PROFILE_REASON": profile.get("profile_reason") or "",
+        "RUNNER_TASK_ID": profile.get("task_id") or "",
+        "RUNNER_TASK_TITLE": profile.get("task_title") or "",
+        "RUNNER_PROFILE_SOURCE": profile.get("source") or "",
+    }
+    return "\n".join(f"{name}={shlex.quote(value)}" for name, value in shell_vars.items())
 
 
 def _runner_idle_grace_seconds(default_seconds: float, poll_seconds: float) -> float:
@@ -543,6 +731,7 @@ def make_codex_interactive_runner_script(
     q_project = shlex.quote(project)
     q_dev = shlex.quote(dev)
     q_model = shlex.quote(model)
+    q_reasoning_effort = shlex.quote(reasoning_effort)
     q_runner_log = shlex.quote(str(paths.runner_log))
     q_stop_lock = shlex.quote(str(paths.stop_file))
     q_done_lock = shlex.quote(str(paths.complete_lock))
@@ -569,6 +758,28 @@ while true; do
     break
   fi
 
+  RUNNER_MODEL={q_model}
+  RUNNER_REASONING_EFFORT={q_reasoning_effort}
+  RUNNER_MODEL_PROFILE=""
+  RUNNER_PROFILE_REASON=""
+  RUNNER_TASK_ID=""
+  RUNNER_TASK_TITLE=""
+  RUNNER_PROFILE_SOURCE="fallback"
+  PROFILE_EXPORTS=$(cd {q_repo_home} && PYTHONPATH={q_repo_home}${{PYTHONPATH:+:$PYTHONPATH}} python3 -m src.main __runner-profile \
+    --project {q_project} \
+    --runner-id {q_runner_id} \
+    --dev {q_dev} \
+    --default-model {q_model} \
+    --default-reasoning-effort {q_reasoning_effort} \
+    --format shell 2>>"$RUNNER_LOG")
+  PROFILE_RC=$?
+  if [[ $PROFILE_RC -eq 0 && -n "$PROFILE_EXPORTS" ]]; then
+    eval "$PROFILE_EXPORTS"
+  else
+    log_supervisor "profile resolution failed rc=$PROFILE_RC; using launcher defaults"
+  fi
+  log_supervisor "launching cycle model_profile=${{RUNNER_MODEL_PROFILE:-fallback}} model=$RUNNER_MODEL effort=$RUNNER_REASONING_EFFORT task_id=${{RUNNER_TASK_ID:-}} source=${{RUNNER_PROFILE_SOURCE:-fallback}}"
+
   (cd {q_repo_home} && PYTHONPATH={q_repo_home}${{PYTHONPATH:+:$PYTHONPATH}} python3 -m src.main __runner-controller \
     --project {q_project} \
     --runner-id {q_runner_id} \
@@ -578,8 +789,8 @@ while true; do
   log_supervisor "cycle controller pid=$CONTROLLER_PID"
 
   codex --search --dangerously-bypass-approvals-and-sandbox \
-    -m {q_model} \
-    -c reasoning.effort="{reasoning_effort}"
+    -m "$RUNNER_MODEL" \
+    -c model_reasoning_effort="$RUNNER_REASONING_EFFORT"
   CODEX_RC=$?
   wait "$CONTROLLER_PID"
   CONTROLLER_RC=$?
@@ -1117,8 +1328,9 @@ def run_loop_runner(
     _append_ledger(
         paths,
         "runner.start",
-        model=model,
-        reasoning_effort=reasoning_effort,
+        default_model=model,
+        default_reasoning_effort=reasoning_effort,
+        routing_mode="per_task",
         session_name=session_name,
     )
     hooks.emit(
@@ -1127,7 +1339,7 @@ def run_loop_runner(
         project,
         runner_id,
         int(state.get("iteration", 0)),
-        {"model": model, "reasoning_effort": reasoning_effort},
+        {"model": model, "reasoning_effort": reasoning_effort, "routing_mode": "per_task"},
     )
     write_json(
         paths.active_lock,
@@ -1220,25 +1432,53 @@ def run_loop_runner(
                 },
             )
 
+            iteration_profile = resolve_active_task_execution_profile(
+                paths=paths,
+                fallback_model=model,
+                fallback_reasoning_effort=reasoning_effort,
+            )
+            iteration_model = str(iteration_profile.get("model") or model)
+            iteration_reasoning_effort = str(iteration_profile.get("reasoning_effort") or reasoning_effort)
+            iteration_model_profile = str(iteration_profile.get("model_profile") or "").strip() or "fallback"
             prompt = _build_prompt(project=project, runner_id=runner_id, paths=paths)
-            _log_line(paths, f"Iteration {iteration} running {model}")
-            _append_ledger(paths, "iteration.start", iteration=iteration, model=model)
+            _log_line(
+                paths,
+                (
+                    f"Iteration {iteration} running {iteration_model} "
+                    f"(profile={iteration_model_profile}, effort={iteration_reasoning_effort})"
+                ),
+            )
+            _append_ledger(
+                paths,
+                "iteration.start",
+                iteration=iteration,
+                model=iteration_model,
+                reasoning_effort=iteration_reasoning_effort,
+                model_profile=iteration_profile.get("model_profile"),
+                task_id=iteration_profile.get("task_id"),
+                profile_source=iteration_profile.get("source"),
+            )
             hooks.emit(
                 "on_step",
                 utc_now(),
                 project,
                 runner_id,
                 iteration,
-                {"model": model, "reasoning_effort": reasoning_effort},
+                {
+                    "model": iteration_model,
+                    "reasoning_effort": iteration_reasoning_effort,
+                    "model_profile": iteration_profile.get("model_profile"),
+                    "task_id": iteration_profile.get("task_id"),
+                },
             )
 
             resume_session_id = None
             result = run_codex_iteration(
                 cwd=project_root,
-                model=model,
+                model=iteration_model,
                 prompt=prompt,
                 session_id=resume_session_id,
-                reasoning_effort=reasoning_effort,
+                reasoning_effort=iteration_reasoning_effort,
                 json_stream=False,
                 logger=lambda line: _log_line(paths, line),
             )
@@ -1254,6 +1494,9 @@ def run_loop_runner(
                 paths,
                 "iteration.finish",
                 iteration=iteration,
+                model=iteration_model,
+                reasoning_effort=iteration_reasoning_effort,
+                model_profile=iteration_profile.get("model_profile"),
                 exit_code=result.exit_code,
                 final_message=result.final_message,
                 session_id=session_id,
@@ -1275,8 +1518,8 @@ def run_loop_runner(
             update_payload, finalize_mode, parse_error, finalize_probe_error = _resolve_iteration_update(
                 paths=paths,
                 project_root=project_root,
-                model=model,
-                reasoning_effort=reasoning_effort,
+                model=iteration_model,
+                reasoning_effort=iteration_reasoning_effort,
                 state=state,
                 result=result,
                 iteration=iteration,
@@ -1456,6 +1699,42 @@ def run_loop_worker(argv: list[str]) -> int:
     )
 
 
+def parse_runner_profile_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Resolve per-task runner model profile")
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--runner-id", required=True)
+    parser.add_argument("--dev", default=os.environ.get("DEV", "/Users/jian/Dev"))
+    parser.add_argument("--default-model", required=True)
+    parser.add_argument("--default-reasoning-effort", required=True)
+    parser.add_argument("--format", choices=("json", "shell"), default="json")
+    return parser.parse_args(argv)
+
+
+def run_runner_profile(argv: list[str]) -> int:
+    args = parse_runner_profile_args(argv)
+    project_root = resolve_target_project_root(
+        dev=args.dev,
+        project=args.project,
+        runner_id=args.runner_id,
+    )
+    paths = build_runner_state_paths_for_root(
+        project_root=project_root,
+        dev=args.dev,
+        project=args.project,
+        runner_id=args.runner_id,
+    )
+    profile = resolve_active_task_execution_profile(
+        paths=paths,
+        fallback_model=args.default_model,
+        fallback_reasoning_effort=args.default_reasoning_effort,
+    )
+    if args.format == "shell":
+        print(render_runner_profile_shell_exports(profile))
+    else:
+        print(json.dumps(profile))
+    return 0
+
+
 def parse_runner_controller_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Internal infinite runner controller")
     parser.add_argument("--project", required=True)
@@ -1488,7 +1767,10 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
 
     ensure_memory_dir(state_paths)
     state = read_json(state_paths.state_file) or {}
-    state = update_state(state_paths.state_file, state, status="running", current_step="interactive_runner")
+    pending_update_profile = _pending_update_profile_from_state(state)
+    active_step: Literal["execute", "update"] = "update" if pending_update_profile else "execute"
+    next_current_step = f"{RUNNER_UPDATE_PENDING_PREFIX}:{pending_update_profile}" if pending_update_profile else "interactive_runner"
+    state = update_state(state_paths.state_file, state, status="running", current_step=next_current_step)
     state_paths.active_lock.write_text(
         f"started_at={utc_now()}\nproject={project}\nrunner_id={runner_id}\nsession={session_name}\nmode=interactive\n"
     )
@@ -1498,7 +1780,6 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
     last_output = ""
     last_output_change_at = time.time()
     in_flight = False
-    active_step: Literal["execute", "update"] = "execute"
     injected_phase = "discover"
     dispatch_output_snapshot = ""
     dispatched_command = ""
@@ -1594,8 +1875,6 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         prompt_completed = True
 
                 if prompt_completed and active_step == "execute":
-                    in_flight = False
-                    active_step = "update"
                     _append_ledger(
                         state_paths,
                         "runner.execute_complete",
@@ -1603,8 +1882,101 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         completed_at=utc_now(),
                     )
                     _log_line(state_paths, f"Execute completed for phase={injected_phase}")
-                    time.sleep(args.poll_seconds)
-                    continue
+                    update_request = _parse_execute_update_request(output)
+                    if bool(update_request.get("needs_update")):
+                        update_profile = str(update_request.get("update_profile") or "mini")
+                        update_reason = str(update_request.get("update_reason") or "").strip()
+                        state = update_state(
+                            state_paths.state_file,
+                            state,
+                            status="running",
+                            current_step=f"{RUNNER_UPDATE_PENDING_PREFIX}:{update_profile}",
+                        )
+                        _append_ledger(
+                            state_paths,
+                            "runner.update_requested",
+                            phase=injected_phase,
+                            update_profile=update_profile,
+                            update_reason=update_reason or None,
+                        )
+                        _log_line(
+                            state_paths,
+                            (
+                                f"Execute requested semantic run_update for phase={injected_phase}; "
+                                f"scheduling fresh {update_profile} update session"
+                            ),
+                        )
+                    else:
+                        refresh_ok, refresh_error = _run_scripted_cycle_refresh(
+                            dev=dev,
+                            project=project,
+                            runner_id=runner_id,
+                            project_root=project_root,
+                        )
+                        if refresh_ok:
+                            state = update_state(
+                                state_paths.state_file,
+                                state,
+                                status="running",
+                                current_step="",
+                            )
+                            _append_ledger(
+                                state_paths,
+                                "runner.scripted_refresh_complete",
+                                phase=injected_phase,
+                            )
+                            _log_line(
+                                state_paths,
+                                (
+                                    f"Scripted refresh completed for phase={injected_phase}; "
+                                    "prepared marker written and next loop will restart fresh"
+                                ),
+                            )
+                        else:
+                            state = update_state(
+                                state_paths.state_file,
+                                state,
+                                status="running",
+                                current_step=f"{RUNNER_UPDATE_PENDING_PREFIX}:mini",
+                            )
+                            _append_ledger(
+                                state_paths,
+                                "runner.scripted_refresh_failed",
+                                phase=injected_phase,
+                                error=refresh_error or "unknown",
+                            )
+                            _log_line(
+                                state_paths,
+                                (
+                                    f"Scripted refresh failed after execute for phase={injected_phase}; "
+                                    f"falling back to fresh mini run_update reason={refresh_error or 'unknown'}"
+                                ),
+                            )
+                    eof_sent = tmux.send_eof(session_name)
+                    if not eof_sent:
+                        _append_ledger(
+                            state_paths,
+                            "runner.chat_exit_failed",
+                            phase=injected_phase,
+                            session_name=session_name,
+                        )
+                        _log_line(
+                            state_paths,
+                            f"Execute completed for phase={injected_phase}, but failed to exit Codex chat cleanly",
+                        )
+                        state = update_state(state_paths.state_file, state, status="error", current_step="")
+                        return 1
+                    _append_ledger(
+                        state_paths,
+                        "runner.chat_exit_requested",
+                        phase=injected_phase,
+                        session_name=session_name,
+                    )
+                    _log_line(
+                        state_paths,
+                        f"Requested Codex chat exit after execute for phase={injected_phase}; next loop will relaunch fresh",
+                    )
+                    return 0
 
                 if prompt_completed and active_step == "update" and update_marker_observed:
                     update_marker_mtime = current_marker_mtime
@@ -1648,6 +2020,11 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                     return 0
 
             if not in_flight and pane_state == "idle" and dispatch_idle_grace_satisfied:
+                active_profile = resolve_active_task_execution_profile(
+                    paths=state_paths,
+                    fallback_model="gpt-5.4",
+                    fallback_reasoning_effort="high",
+                )
                 if active_step == "execute":
                     command = _build_execute_only_command(
                         dev=dev,
@@ -1698,6 +2075,10 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         step=active_step,
                         command=command,
                         injected_at=injected_at,
+                        model=active_profile.get("model"),
+                        reasoning_effort=active_profile.get("reasoning_effort"),
+                        model_profile=active_profile.get("model_profile"),
+                        task_id=active_profile.get("task_id"),
                     )
                     if active_step == "update":
                         _append_ledger(
@@ -1712,7 +2093,15 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                             f"Dispatched /prompts:run_update for phase={phase}; waiting for prepared marker before fresh restart",
                         )
                     else:
-                        _log_line(state_paths, f"Dispatched {active_step} for phase={phase}")
+                        _log_line(
+                            state_paths,
+                            (
+                                f"Dispatched {active_step} for phase={phase} "
+                                f"(profile={active_profile.get('model_profile') or 'fallback'}, "
+                                f"model={active_profile.get('model')}, "
+                                f"effort={active_profile.get('reasoning_effort')})"
+                            ),
+                        )
                 else:
                     _append_ledger(
                         state_paths,

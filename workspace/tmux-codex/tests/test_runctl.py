@@ -115,6 +115,23 @@ class RunctlTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["next_task_id"], "TT-001")
 
+    def test_setup_refresh_preserves_enablement_after_approval(self):
+        initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        token = initial["enable_token"]
+        approved = create_runner_state(str(self.dev), "blog", "main", approve_enable=token)
+        self.assertTrue(approved["ok"])
+
+        refreshed = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        self.assertTrue(refreshed["ok"])
+
+        paths = self._paths()
+        state = read_json(paths.state_file)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertTrue(state["enabled"])
+        self.assertEqual(state["status"], "ready")
+        self.assertFalse(paths.enable_pending.exists())
+
     def test_inspect_runner_start_state_auto_repairs_runner_prompt_install_drift(self):
         initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         token = initial["enable_token"]
@@ -343,6 +360,102 @@ class RunctlTests(unittest.TestCase):
         assert state is not None
         self.assertEqual(state["next_task_id"], "TT-020")
         self.assertEqual(state["next_task"], "Highest priority oldest")
+
+    def test_setup_preserves_task_profile_metadata_and_writes_exec_context_scope(self):
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        project_root = self.dev / "Repos" / "blog"
+
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-010h1",
+                    "title": "Migrate runtime-context family",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["Move runtime-context ownership into app-shell public seams."],
+                    "validation": ["Run targeted runtime-context tests."],
+                    "model_profile": "mini",
+                    "profile_reason": "bounded app-shell runtime-context family",
+                    "touch_paths": [
+                        "desktop/src/app-layout/selectAppLayoutRuntimeContext*",
+                        "desktop/src/app-layout/useAppLayoutRuntimeContext*",
+                    ],
+                    "validation_commands": [
+                        "pnpm -C desktop exec vitest run src/app-layout/runtime-context.test.ts",
+                    ],
+                    "deprecation_phase": "consumer_migration",
+                    "fanout_risk": "low",
+                    "spillover_paths": ["desktop/src/app-store/**"],
+                    "coupling_notes": ["Crossing into app-store selectors means the slice should be split or escalated."],
+                    "updated_at": "2026-03-17T00:00:00Z",
+                }
+            ]
+        )
+
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+
+        paths = self._paths()
+        tasks_payload = read_json(paths.tasks_json)
+        exec_context = read_json(paths.exec_context_json)
+        self.assertIsNotNone(tasks_payload)
+        self.assertIsNotNone(exec_context)
+        assert tasks_payload is not None
+        assert exec_context is not None
+
+        task = tasks_payload["tasks"][0]
+        self.assertEqual(task["model_profile"], "mini")
+        self.assertEqual(task["profile_reason"], "bounded app-shell runtime-context family")
+        self.assertEqual(task["touch_paths"][0], "desktop/src/app-layout/selectAppLayoutRuntimeContext*")
+        self.assertEqual(task["validation_commands"][0], "pnpm -C desktop exec vitest run src/app-layout/runtime-context.test.ts")
+        self.assertEqual(task["coupling_notes"][0], "Crossing into app-store selectors means the slice should be split or escalated.")
+        self.assertEqual(exec_context["model_profile"], "mini")
+        self.assertEqual(exec_context["deprecation_phase"], "consumer_migration")
+        self.assertEqual(exec_context["fanout_risk"], "low")
+        self.assertEqual(exec_context["touch_paths"][0], "desktop/src/app-layout/selectAppLayoutRuntimeContext*")
+        self.assertEqual(exec_context["validation_commands"][0], "pnpm -C desktop exec vitest run src/app-layout/runtime-context.test.ts")
+        self.assertEqual(exec_context["coupling_notes"][0], "Crossing into app-store selectors means the slice should be split or escalated.")
+
+    def test_setup_skips_open_superseded_task_when_actionable_slice_exists(self):
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        project_root = self.dev / "Repos" / "blog"
+
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-010",
+                    "title": "Move desktop app-shell ownership (SUPERSEDED)",
+                    "status": "open",
+                    "priority": "p0",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["superseded"],
+                    "validation": ["verify"],
+                    "updated_at": "2026-03-17T00:00:00Z",
+                },
+                {
+                    "task_id": "TT-010h1",
+                    "title": "Migrate runtime-context family",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "updated_at": "2026-03-17T00:01:00Z",
+                },
+            ]
+        )
+
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        state = read_json(self._paths().state_file)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(state["next_task_id"], "TT-010h1")
 
     def test_setup_hardens_parity_task_acceptance_and_validation(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
@@ -742,7 +855,7 @@ class RunctlTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(mocked_stdout.getvalue().strip(), "ok=1")
 
-    def test_prepare_cycle_uses_cycle_progress_baseline_across_setup_refresh(self):
+    def test_prepare_cycle_preserves_cycle_progress_baseline_across_setup_refresh_task_advance(self):
         project_root = self.dev / "Repos" / "blog"
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         self._write_tasks(

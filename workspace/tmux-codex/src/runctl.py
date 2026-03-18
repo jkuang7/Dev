@@ -35,6 +35,9 @@ from .runner_state import (
 
 TASK_STATUS_VALUES = {"open", "in_progress", "blocked", "done"}
 TASK_PRIORITY_ORDER = {"p0": 0, "p1": 1, "p2": 2, "p3": 3}
+TASK_MODEL_PROFILES = {"mini", "high"}
+TASK_FANOUT_RISKS = {"low", "medium", "high"}
+TASK_DEPRECATION_PHASES = {"seam", "shim", "consumer_migration", "convergence", "removal"}
 SETUP_EVENT_COALESCE_SECONDS = 90
 RUNNER_PROMPT_NAMES = ("run_setup", "run_execute", "run_update", "add")
 
@@ -667,6 +670,25 @@ def _sync_runner_handoff_file(
         task_acceptance = []
     if not isinstance(task_validation, list):
         task_validation = []
+    model_profile = _normalize_choice(selected_task.get("model_profile"), TASK_MODEL_PROFILES) if isinstance(selected_task, dict) else None
+    profile_reason = _normalize_line(str(selected_task.get("profile_reason", ""))) if isinstance(selected_task, dict) else ""
+    fanout_risk = _normalize_choice(selected_task.get("fanout_risk"), TASK_FANOUT_RISKS) if isinstance(selected_task, dict) else None
+    deprecation_phase = (
+        _normalize_choice(selected_task.get("deprecation_phase"), TASK_DEPRECATION_PHASES)
+        if isinstance(selected_task, dict)
+        else None
+    )
+    touch_paths = _normalize_text_list(selected_task.get("touch_paths"), item_chars=220, max_items=8) if isinstance(selected_task, dict) else []
+    validation_commands = (
+        _normalize_text_list(selected_task.get("validation_commands"), item_chars=220, max_items=3)
+        if isinstance(selected_task, dict)
+        else []
+    )
+    coupling_notes = (
+        _normalize_text_list(selected_task.get("coupling_notes"), item_chars=220, max_items=4)
+        if isinstance(selected_task, dict)
+        else []
+    )
     completed_recent = [str(item).strip() for item in state.get("completed_recent", []) if str(item).strip()]
     blockers = [str(item).strip() for item in state.get("blockers", []) if str(item).strip()]
     open_items = _extract_open_tasks_from_payload(tasks_payload, max_items=8)
@@ -688,8 +710,25 @@ def _sync_runner_handoff_file(
         f"- Next task: {' '.join(part for part in (next_task_id, next_task or selected_title) if part).strip() or '(none)'}",
         f"- Why next: {next_task_reason or '(none)'}",
     ]
+    if model_profile:
+        lines.append(f"- Model profile: {model_profile}")
+    if profile_reason:
+        lines.append(f"- Profile reason: {profile_reason}")
+    if fanout_risk:
+        lines.append(f"- Fanout risk: {fanout_risk}")
+    if deprecation_phase:
+        lines.append(f"- Deprecation phase: {deprecation_phase}")
     if _as_text(state.get("last_iteration_summary")):
         lines.extend(["", "## Last Session Summary", "", _as_text(state.get("last_iteration_summary"))])
+    if touch_paths:
+        lines.extend(["", "## Touch Paths", ""])
+        lines.extend([f"- {item}" for item in touch_paths])
+    if validation_commands:
+        lines.extend(["", "## Validation Commands", ""])
+        lines.extend([f"- {item}" for item in validation_commands])
+    if coupling_notes:
+        lines.extend(["", "## Coupling Notes", ""])
+        lines.extend([f"- {item}" for item in coupling_notes])
     if completed_recent:
         lines.extend(["", "## Recently Completed", ""])
         lines.extend([f"- {item}" for item in completed_recent[:5]])
@@ -737,6 +776,35 @@ def _normalize_objective_title(raw: str) -> str:
 
 def _task_priority_rank(priority: str) -> int:
     return TASK_PRIORITY_ORDER.get(priority.strip().lower(), 999)
+
+
+def _normalize_choice(raw: Any, allowed: set[str]) -> str | None:
+    value = _as_text(raw).lower()
+    if value in allowed:
+        return value
+    return None
+
+
+def _normalize_text_list(raw: Any, *, item_chars: int = 220, max_items: int = 16) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    items: list[str] = []
+    for item in raw:
+        candidate = re.sub(r"\s+", " ", str(item)).strip(" -\t").strip("`")
+        if not candidate:
+            continue
+        items.append(candidate[:item_chars])
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _task_marked_superseded(task: dict[str, Any]) -> bool:
+    title = _as_text(task.get("title")).lower()
+    acceptance = " ".join(str(item).strip().lower() for item in task.get("acceptance", []) if str(item).strip())
+    validation = " ".join(str(item).strip().lower() for item in task.get("validation", []) if str(item).strip())
+    combined = " ".join((title, acceptance, validation))
+    return "superseded" in combined
 
 
 def _normalize_task_entry(
@@ -799,10 +867,30 @@ def _normalize_task_entry(
         "validation": validation,
         "updated_at": updated_at,
         "objective_id": _as_text(raw.get("objective_id")) or objective_id,
+        "model_profile": _normalize_choice(raw.get("model_profile"), TASK_MODEL_PROFILES) or "high",
+        "fanout_risk": _normalize_choice(raw.get("fanout_risk"), TASK_FANOUT_RISKS) or "high",
     }
     blocked_reason = _normalize_line(str(raw.get("blocked_reason", "")))
     if blocked_reason:
         normalized["blocked_reason"] = blocked_reason[:220]
+    profile_reason = _normalize_line(str(raw.get("profile_reason", "")))
+    if profile_reason:
+        normalized["profile_reason"] = profile_reason[:220]
+    deprecation_phase = _normalize_choice(raw.get("deprecation_phase"), TASK_DEPRECATION_PHASES)
+    if deprecation_phase:
+        normalized["deprecation_phase"] = deprecation_phase
+    touch_paths = _normalize_text_list(raw.get("touch_paths"), item_chars=220, max_items=24)
+    if touch_paths:
+        normalized["touch_paths"] = touch_paths
+    validation_commands = _normalize_text_list(raw.get("validation_commands"), item_chars=220, max_items=8)
+    if validation_commands:
+        normalized["validation_commands"] = validation_commands
+    spillover_paths = _normalize_text_list(raw.get("spillover_paths"), item_chars=220, max_items=16)
+    if spillover_paths:
+        normalized["spillover_paths"] = spillover_paths
+    coupling_notes = _normalize_text_list(raw.get("coupling_notes"), item_chars=220, max_items=8)
+    if coupling_notes:
+        normalized["coupling_notes"] = coupling_notes
     return normalized
 
 
@@ -999,6 +1087,9 @@ def _select_next_task(tasks_payload: dict[str, Any]) -> tuple[dict[str, Any] | N
     ]
     if not open_tasks:
         return None, "No open tasks remain in TASKS.json."
+    candidate_tasks = [task for task in open_tasks if not _task_marked_superseded(task)]
+    if not candidate_tasks:
+        candidate_tasks = open_tasks
 
     def sort_key(task: dict[str, Any]) -> tuple[int, float, str]:
         priority = _task_priority_rank(str(task.get("priority", "p1")))
@@ -1006,11 +1097,11 @@ def _select_next_task(tasks_payload: dict[str, Any]) -> tuple[dict[str, Any] | N
         task_id = str(task.get("task_id", "")).strip()
         return (priority, updated, task_id)
 
-    eligible = [task for task in open_tasks if _task_depends_resolved(task, done_ids)]
+    eligible = [task for task in candidate_tasks if _task_depends_resolved(task, done_ids)]
     if eligible:
         chosen = sorted(eligible, key=sort_key)[0]
         return chosen, "Deterministic selection: open + dependencies resolved + priority + oldest updated_at."
-    blocked = sorted(open_tasks, key=sort_key)[0]
+    blocked = sorted(candidate_tasks, key=sort_key)[0]
     return blocked, "Open tasks exist but dependencies are unresolved; selected oldest open task for visibility."
 
 
@@ -1171,6 +1262,11 @@ def _build_phase_context_delta(
     last_iteration_summary: str,
     task_acceptance: list[str],
     task_validation: list[str],
+    model_profile: str | None,
+    fanout_risk: str | None,
+    touch_paths: list[str],
+    validation_commands: list[str],
+    coupling_notes: list[str],
 ) -> dict[str, Any]:
     return {
         "phase": phase,
@@ -1184,6 +1280,11 @@ def _build_phase_context_delta(
         "last_iteration_summary": last_iteration_summary,
         "task_acceptance_top3": task_acceptance[:3],
         "task_validation_top3": task_validation[:3],
+        "model_profile": model_profile,
+        "fanout_risk": fanout_risk,
+        "touch_paths_top8": touch_paths[:8],
+        "validation_commands_top3": validation_commands[:3],
+        "coupling_notes_top4": coupling_notes[:4],
         "open_tasks_count": open_tasks_count,
         "done_gate_status": done_gate_status_value,
         "phase_status": phase_status,
@@ -1239,16 +1340,40 @@ def _write_exec_context(
         if isinstance(existing_exec_context, dict)
         else None
     )
-    if not isinstance(preserved_cycle_baseline, dict):
-        preserved_cycle_baseline = current_snapshot
     task_id = _as_text(task.get("task_id")) if isinstance(task, dict) else ""
     task_title = _as_text(task.get("title")) if isinstance(task, dict) else ""
+    existing_objective_id = _as_text(existing_exec_context.get("objective_id")) if isinstance(existing_exec_context, dict) else ""
+    existing_project_root = _as_text(existing_exec_context.get("project_root")) if isinstance(existing_exec_context, dict) else ""
+    existing_target_branch = _as_text(existing_exec_context.get("target_branch")) if isinstance(existing_exec_context, dict) else ""
+    if (
+        not isinstance(preserved_cycle_baseline, dict)
+        or (existing_objective_id and existing_objective_id != _as_text(prd_payload.get("objective_id")))
+        or (existing_project_root and existing_project_root != str(project_root.resolve()))
+        or (existing_target_branch and target_branch and existing_target_branch != target_branch)
+    ):
+        preserved_cycle_baseline = current_snapshot
     acceptance = task.get("acceptance") if isinstance(task, dict) else []
     validation = task.get("validation") if isinstance(task, dict) else []
     if not isinstance(acceptance, list):
         acceptance = []
     if not isinstance(validation, list):
         validation = []
+    model_profile = _normalize_choice(task.get("model_profile"), TASK_MODEL_PROFILES) if isinstance(task, dict) else None
+    profile_reason = _normalize_line(str(task.get("profile_reason", ""))) if isinstance(task, dict) else ""
+    fanout_risk = _normalize_choice(task.get("fanout_risk"), TASK_FANOUT_RISKS) if isinstance(task, dict) else None
+    deprecation_phase = (
+        _normalize_choice(task.get("deprecation_phase"), TASK_DEPRECATION_PHASES) if isinstance(task, dict) else None
+    )
+    touch_paths = _normalize_text_list(task.get("touch_paths"), item_chars=220, max_items=24) if isinstance(task, dict) else []
+    validation_commands = (
+        _normalize_text_list(task.get("validation_commands"), item_chars=220, max_items=8) if isinstance(task, dict) else []
+    )
+    spillover_paths = (
+        _normalize_text_list(task.get("spillover_paths"), item_chars=220, max_items=16) if isinstance(task, dict) else []
+    )
+    coupling_notes = (
+        _normalize_text_list(task.get("coupling_notes"), item_chars=220, max_items=8) if isinstance(task, dict) else []
+    )
     parity_fail_closed = _looks_like_strict_parity_task(
         title=task_title,
         acceptance=[str(item) for item in acceptance if str(item).strip()],
@@ -1274,6 +1399,14 @@ def _write_exec_context(
         "next_task_reason": _as_text(state.get("next_task_reason")) or None,
         "task_acceptance": [str(item) for item in acceptance if str(item).strip()],
         "task_validation": [str(item) for item in validation if str(item).strip()],
+        "model_profile": model_profile or None,
+        "profile_reason": profile_reason or None,
+        "fanout_risk": fanout_risk or None,
+        "deprecation_phase": deprecation_phase or None,
+        "touch_paths": touch_paths,
+        "validation_commands": validation_commands,
+        "spillover_paths": spillover_paths,
+        "coupling_notes": coupling_notes,
         "project_root": str(project_root.resolve()),
         "target_branch": target_branch or None,
         "state_revision": int(state.get("state_revision", 0)),
@@ -1538,6 +1671,7 @@ def create_runner_state(
         project=project,
         runner_id=runner_id,
     )
+    previous_state = read_json(paths.state_file) or {}
     ensure_memory_dir(paths)
     created: list[str] = []
     if approve_enable is None:
@@ -1556,7 +1690,6 @@ def create_runner_state(
     previous_done_gate = "pending"
     previous_done_candidate = False
     previous_status = ""
-    previous_state = read_json(paths.state_file) or {}
     if approve_enable is None:
         preserved_enabled = bool(previous_state.get("enabled", False))
         raw_decision = previous_state.get("last_hil_decision")
@@ -1787,6 +1920,31 @@ def create_runner_state(
             for item in ((selected_task or {}).get("validation") if isinstance(selected_task, dict) else [])
             if str(item).strip()
         ],
+        model_profile=(
+            _normalize_choice((selected_task or {}).get("model_profile"), TASK_MODEL_PROFILES)
+            if isinstance(selected_task, dict)
+            else None
+        ),
+        fanout_risk=(
+            _normalize_choice((selected_task or {}).get("fanout_risk"), TASK_FANOUT_RISKS)
+            if isinstance(selected_task, dict)
+            else None
+        ),
+        touch_paths=(
+            _normalize_text_list((selected_task or {}).get("touch_paths"), item_chars=220, max_items=24)
+            if isinstance(selected_task, dict)
+            else []
+        ),
+        validation_commands=(
+            _normalize_text_list((selected_task or {}).get("validation_commands"), item_chars=220, max_items=8)
+            if isinstance(selected_task, dict)
+            else []
+        ),
+        coupling_notes=(
+            _normalize_text_list((selected_task or {}).get("coupling_notes"), item_chars=220, max_items=8)
+            if isinstance(selected_task, dict)
+            else []
+        ),
     )
 
     state = update_state(
@@ -2156,7 +2314,18 @@ def _inspect_runner_start_state(
         }
 
     task_status = _as_text(matching_task.get("status")).lower()
-    if task_status not in {"open", "in_progress", "blocked"}:
+    if task_status == "blocked":
+        blocked_reason = _as_text(matching_task.get("blocked_reason"))
+        blocked_suffix = f" Reason: {blocked_reason}." if blocked_reason else ""
+        return {
+            "ok": False,
+            "error": f"Runner task {next_task_id} is blocked.{blocked_suffix}",
+            "project": project,
+            "runner_id": runner_id,
+            "project_root": str(resolved_root),
+        }
+
+    if task_status not in {"open", "in_progress"}:
         if allow_refresh_repair:
             create_runner_state(
                 dev=dev,

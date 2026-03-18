@@ -18,6 +18,6 @@ for prompt_name in run_setup run_execute run_update add; do
     rm -f "$DEST"
   fi
 
-  install -m 0644 "$SRC" "$DEST"
-  echo "Installed prompt: $DEST <= $SRC"
+  ln -s "$SRC" "$DEST"
+  echo "Installed prompt link: $DEST -> $SRC"
 done

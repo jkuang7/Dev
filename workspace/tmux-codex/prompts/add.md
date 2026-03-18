@@ -14,10 +14,14 @@ If the user is not asking to add runner backlog, stop and say this prompt only q
 - Resolve the raw task request from the slash-command argument text after `/add`.
 - If the request is empty, ask the human for the task in one sentence.
 - Keep the original intent compact; do not inflate it into a long plan.
+- If the request is short or underspecified, combine it with the active conversation context before queueing it.
 
 ## Scope Resolution (Do This First)
 
 Infer the target runner root in this order:
+
+- If the human gives a repo path ending in `.memory`, normalize it back to the repo root before resolving runner scope.
+- Example path normalization: `/Users/jian/Dev/Repos/time-track/.memory` should resolve to `/Users/jian/Dev/Repos/time-track`.
 
 1. If the current working directory or any ancestor contains `.memory/runner/runtime/RUNNER_STATE.json`, use that ancestor as `<target_root>`.
 2. Otherwise, if the current working directory is inside a git repo, use the repo root basename as `<project>` and resolve it via:
@@ -31,6 +35,13 @@ Rules:
 - Prefer the current conversation/worktree root over canonical repo fallback.
 - Do not create or refresh runner setup from `/add`.
 - Do not switch projects silently if scope is ambiguous.
+- Treat the current conversation as the default repo signal when scope is otherwise ambiguous.
+
+## Existing Task Triage
+
+- Read `.memory/PRD.md` if it exists for the older objective wording.
+- Read `.memory/lessons.md` if it exists for durable project-specific constraints.
+- Use `RUNNER_TASK_INTAKE.json` only as intake/audit context; do not treat it as the source of truth over `TASKS.json`.
 
 ## Read Minimal Context
 
@@ -68,6 +79,12 @@ Queue the task with:
 
 ```bash
 python3 /Users/jian/Dev/workspace/tmux-codex/bin/runctl --task add --project-root <target_root> --runner-id main --title "<title>" ...
+```
+
+If the request is really asking to tighten or correct an existing queued task instead of adding a new one, update it with:
+
+```bash
+python3 /Users/jian/Dev/workspace/tmux-codex/bin/runctl --task set --project-root <target_root> --runner-id main --task-id TT-... ...
 ```
 
 Then show the queued intake with:

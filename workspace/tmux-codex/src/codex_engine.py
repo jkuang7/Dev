@@ -134,7 +134,7 @@ def run_codex_iteration(
     logger: Callable[[str], None] | None = None,
 ) -> CodexRunResult:
     """Run one Codex iteration and parse JSONL stream."""
-    reasoning_config = f'reasoning.effort="{reasoning_effort}"'
+    reasoning_config = f'model_reasoning_effort="{reasoning_effort}"'
     prefix = ["codex"]
     if enable_search:
         prefix.append("--search")

@@ -29,6 +29,12 @@ Before running setup without an approval token, inspect the setup inputs:
 - `<target_root>/.memory/runner/TASKS.json` if it exists
 - `<target_root>/.memory/PRD.md` if it exists
 - any directly relevant repo planning doc explicitly referenced by the user
+- current repo state, not just stored memory:
+  - `git status --short`
+  - `git diff --stat` when the worktree is already dirty
+  - destination seams that already exist on disk
+  - legacy families that already import the destination seam
+  - broad deprecation markers or compatibility wrappers already in progress
 
 Treat the following as generic or stale and replace them for the new setup run:
 
@@ -48,19 +54,74 @@ Use the latest explicit user goal as the source of truth. Distill broad notes in
 - 1-3 bounded open tasks
 - acceptance and validation that name the real blocker or parity target
 
+For dependency-heavy migration work, `run_setup` is the strong planning gate:
+
+- assume `run_setup` is the expensive planning step and use `gpt-5.4` with `high` reasoning here
+- do the dependency analysis here before the infinite runner starts
+- split work by independent file family and safe deprecation phase instead of broad architecture labels
+- if a slice cannot be completed safely by a cheaper model without crossing seams or widening scope, mark it `high`
+- only mark a slice `mini` when it is dependency-contained and does not need architectural judgment
+- respect safe deprecation order: `seam` -> `shim` -> `consumer_migration` -> `convergence` -> `removal`
+
+Deep-analysis grouping rules:
+
+- derive candidate slices from repo evidence, not just prose:
+  - current dirty worktree concentration
+  - dominant file family
+  - dominant import/dependency cluster
+  - destination seam/library
+  - safe-deprecation phase
+- if current uncommitted changes already concentrate on one migration family, prefer stabilizing that in-flight family first instead of seeding a brand-new unrelated slice
+- if the repo already has broad deprecation comments without a corresponding destination seam, seed a stronger seam-or-readiness task before cheap consumer-migration slices
+- prefer one destination seam and one file family per seeded task
+- if a candidate slice crosses more than one major ownership seam or more than two dependency clusters, split it or mark it `high`
+- if a candidate slice mixes seam creation with removal, split it into separate phased tasks
+- if a candidate slice would require touching files outside its declared scope to finish cleanly, split it before setup completes
+- if unrelated dirty files are present, keep them out of `touch_paths` and call them out explicitly in `coupling_notes` rather than silently absorbing them into the slice
+
+Model-efficient seeding rules:
+
+- keep active task wording compact and operational, not historical
+- prefer active backlog only: collapse historical done-task diaries out of `TASKS.json` when reseeding and rewire remaining dependencies to the live backlog
+- cap seeded acceptance to at most 2 lines
+- cap seeded validation to at most 2 lines plus exact `validation_commands`
+- prefer at most 12 production files and 8 test files per `mini` slice
+- prefer at most 3 explicit `validation_commands` per task
+- do not carry long closure diaries or repeated slice evidence into active open tasks; keep that in ledger/handoff instead
+- keep `TASKS.json`, `RUNNER_EXEC_CONTEXT.json`, and `RUNNER_STATE.json` aligned to the same active slice set after reseeding
+
 For complicated parity, migration, or regression-restoration work:
 
 - seed acceptance as fail-closed, not approximate
+- make acceptance fail-closed rather than approximate or implied
 - if the user asks for parity with an older baseline, record the exact baseline commit or artifact in the acceptance/validation text
 - require explicit side-by-side comparison or equivalent concrete proof for parity tasks
 - do not seed vague criteria such as `looks polished`, `matches old styling`, or `restore parity`; name the exact surfaces and the no-known-delta requirement instead
 - make successful completion criteria explicit enough that a later runner cycle can tell the difference between exact parity and "closer but still off"
+
+For subjective polish or UX work that is not baseline matching:
+
+- keep the task fail-closed by naming the exact surface, evidence path, and no-known-issue bar instead of vague polish language
 
 Task seeding must be narrow enough for a single runner slice:
 
 - `TT-001` must name the first executable surface, blocker, or file cluster to touch first
 - each seeded task must be completable or decisively re-scopable within one bounded runner iteration
 - split umbrella work into ordered tasks instead of one broad task
+- group file changes so each task owns one coherent file family and one destination seam
+- reject or split tasks that mix seam creation with cleanup/removal, mix app-shell with core-store, or require edits outside their proposed scope
+
+For every seeded task:
+
+- set `model_profile` to `mini` or `high`
+- include `profile_reason`
+- include `touch_paths`
+- include `validation_commands`
+- include `deprecation_phase`
+- include `fanout_risk`
+- include `spillover_paths` when adjacent families are explicitly out of scope
+- include `coupling_notes` that name the exact seam, file family, or dependency edge most likely to force spillover if the slice is not respected
+- make `profile_reason` explain why the slice is cheap-model-safe or why it must stay on the stronger model
 
 Do not seed broad task titles such as:
 

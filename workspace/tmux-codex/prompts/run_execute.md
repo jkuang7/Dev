@@ -29,6 +29,15 @@ Resolve phase from:
 2. `RUNNER_EXEC_CONTEXT.json.phase`
 
 Load only the compact `context_sources` and `context_delta` from `RUNNER_EXEC_CONTEXT.json` before extra repo reads.
+Use the active task metadata in `RUNNER_EXEC_CONTEXT.json` as hard scope:
+
+- `model_profile`
+- `touch_paths`
+- `validation_commands`
+- `deprecation_phase`
+- `spillover_paths`
+- `profile_reason`
+- `coupling_notes`
 
 Work within:
 - the current `phase_goal`
@@ -42,7 +51,11 @@ Target shape for the slice:
 
 Rules:
 - do not do setup/clear behavior here
+- do not run `runctl --setup` or `runctl --prepare-cycle` here; the controller scripts deterministic refresh itself after this prompt
 - do not expand into broad preflight unless closeout truly requires it
+- do not widen beyond `touch_paths` unless you first prove the slice is blocked or must be split
+- use `validation_commands` as the default verification surface for this slice before inventing wider checks
+- if the repo already has unrelated dirty files outside `touch_paths`, leave them alone and keep them out of the slice
 - do not treat read-only inspection or prompt restatement as completed work
 - do not advance just because code changed, one test passed, or the result feels closer
 - treat the current `TT-*` as the stable unit of ownership; medium slices are execution chunks, not reasons to advance to a different task
@@ -56,6 +69,11 @@ Rules:
 - if new in-scope acceptance criteria are discovered while working the task, strengthen the same task's acceptance or validation contract before handoff instead of leaving the requirement implicit
 - only create or switch to a different `TT-*` when the remaining work is genuinely independent of the active task's acceptance target or when one umbrella task must be split into explicit bounded blockers
 - do not move to a different task while the current task's acceptance is still unmet
+- if the active task is marked `mini`, keep the slice dependency-contained and fail closed instead of silently turning it into a `high` task
+- if a `mini` slice needs a second subsystem, a broader file family, or a seam decision to finish, stop and carry that forward as a blocker or `high` escalation instead of widening locally
+- if the active task is marked `high`, keep the work bounded to that one task anyway; stronger reasoning is not permission to sprawl across the backlog
+- treat `coupling_notes` as fail-closed warnings about where the slice is likely to spill; if one of those edges activates, stop and report it instead of improvising across the boundary
+- if the slice turns out to depend on a partially migrated adjacent family, stop at that seam and report the coupling instead of normalizing both families in one pass
 - for any task, passing tests alone is not enough when the stated acceptance still requires behavior, UX, completeness, or polish evidence
 - if the active task acceptance mentions parity, baseline matching, or restoring prior behavior/styling, treat that as fail-closed: do not claim completion on approximate similarity
 - for parity-style tasks, require an explicit comparison against the recorded baseline; if any known delta remains, keep the task open and name the exact remaining surface/blocker
@@ -71,10 +89,13 @@ When the bounded work slice is done:
 - stop after one coherent work surface
 - review your work by asking: `Any problems with the current implementation?`
 - name every real remaining issue, regression, rough edge, or acceptance gap explicitly
+- if the slice was forced to stop because the declared scope was too narrow, say so explicitly so `run_update` can split or escalate it cleanly
+- set `needs_update=yes` only when semantic task metadata must change: new blocker family, scope creep, task split, mini->high escalation, or acceptance/validation rewrite
+- default `needs_update=no` when deterministic refresh plus prepared-marker handoff is enough
 - report compact operational output
 - terminate this Codex chat session immediately
 
-The runner controller will invoke `/prompts:run_update` after this prompt completes.
+The runner controller will script deterministic refresh itself after this prompt completes. It will only invoke `/prompts:run_update` in a separate fresh session when your output explicitly says semantic task-state changes are needed.
 
 ## Output
 
@@ -83,4 +104,6 @@ Keep output compact and operational.
 End with:
 - `phase_done=<yes|no>`
 - `validation=<pass|fail>`
+- `needs_update=<yes|no>`
+- if `needs_update=yes`, optionally add `update_profile=<mini|high>`; omit it unless the update truly needs `high`
 - `exiting=<yes>`

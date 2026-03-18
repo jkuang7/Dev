@@ -18,6 +18,7 @@ from .runner_loop import (
     resolve_runner_profile,
     run_interactive_runner_controller,
     run_loop_worker,
+    run_runner_profile,
 )
 from .runner_state import coerce_runner_phase, read_json
 from .tmux import TmuxClient
@@ -336,8 +337,9 @@ def create_loop_session(
         )
     print(f"  Project:   {project}")
     print(f"  Runner ID: {runner_id}")
-    print(f"  Model:     {model}")
-    print(f"  Effort:    {reasoning_effort}")
+    print(f"  Default model:  {model}")
+    print(f"  Default effort: {reasoning_effort}")
+    print("  Task routing:   per-task (`mini` => cheap model, `high` => gpt-5.4 high)")
     print("  Mode:      interactive-cli")
     print(f"  Phase:     {initial_phase}")
     print(f"  Session:   {session_name}")
@@ -514,6 +516,8 @@ def main() -> None:
     # Public runner entrypoints launch the interactive CLI runner.
     if args and args[0] == "__runner-loop":
         raise SystemExit(run_loop_worker(args[1:]))
+    if args and args[0] == "__runner-profile":
+        raise SystemExit(run_runner_profile(args[1:]))
     if args and args[0] == "__runner-controller":
         raise SystemExit(run_interactive_runner_controller(args[1:]))
 

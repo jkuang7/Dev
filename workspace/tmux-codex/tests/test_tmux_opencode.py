@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import sys
@@ -112,9 +113,12 @@ class SessionMenuRunTests(unittest.TestCase):
             "src.menu.ensure_gates_file", return_value=(Path("/tmp/gates.sh"), True)
         ) as ensure_gates, patch(
             "src.menu.inspect_runner_start_state", return_value={"ok": True}
-        ), patch("src.menu.build_runner_paths", return_value=object()), patch(
+        ), patch("src.menu.build_runner_paths", return_value=SimpleNamespace(state=object())), patch(
+            "src.menu.resolve_active_task_execution_profile",
+            return_value={"model_profile": "mini", "model": "gpt-5.4-mini", "reasoning_effort": "medium", "task_id": "TT-101"},
+        ), patch(
             "src.menu.make_codex_exec_loop_script", return_value="echo runner"
-        ), patch("src.menu.print"):
+        ), patch("src.menu.print") as print_mock:
             attach_name = menu._start_runner_session()
 
         ensure_gates.assert_called_once()
@@ -123,6 +127,8 @@ class SessionMenuRunTests(unittest.TestCase):
         self.assertEqual(kwargs.get("project"), "Blog")
         menu.tmux.create_session.assert_called_once()
         self.assertEqual(attach_name, "runner-Blog")
+        print_mock.assert_any_call("  Started runner-Blog (mini, gpt-5.4-mini, effort=medium)")
+        print_mock.assert_any_call("    active task: TT-101")
 
     def test_runner_start_attaches_first_when_multiple_projects_selected(self):
         menu = self._make_menu()
@@ -133,7 +139,10 @@ class SessionMenuRunTests(unittest.TestCase):
             "src.menu.ensure_gates_file", return_value=(Path("/tmp/gates.sh"), True)
         ), patch(
             "src.menu.inspect_runner_start_state", return_value={"ok": True}
-        ), patch("src.menu.build_runner_paths", return_value=object()), patch(
+        ), patch("src.menu.build_runner_paths", return_value=SimpleNamespace(state=object())), patch(
+            "src.menu.resolve_active_task_execution_profile",
+            return_value={"model_profile": "high", "model": "gpt-5.4", "reasoning_effort": "high", "task_id": "TT-001"},
+        ), patch(
             "src.menu.make_codex_exec_loop_script", return_value="echo runner"
         ), patch("src.menu.print"):
             attach_name = menu._start_runner_session()
@@ -265,6 +274,44 @@ class SessionMenuRunTests(unittest.TestCase):
 
             self.assertEqual(result, (["Blog"], "high"))
 
+    def test_fallback_selector_a_toggles_all_off_when_everything_is_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            tmux = Mock()
+            tmux.list_sessions.return_value = []
+            tmux.get_pane_title.return_value = None
+
+            with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev)}):
+                menu = SessionMenu(tmux)
+                with patch.object(
+                    menu,
+                    "_get_all_projects",
+                    return_value=[("Blog", 0), ("Shop", 0)],
+                ), patch.object(
+                    menu,
+                    "_load_runner_prefs",
+                    return_value={"Blog", "Shop"},
+                ), patch.object(
+                    menu,
+                    "_load_runner_complexity",
+                    return_value="high",
+                ), patch.object(
+                    menu,
+                    "_active_runner_projects",
+                    return_value=set(),
+                ), patch.object(
+                    menu,
+                    "_persist_runner_picker_state",
+                ) as persist_state, patch.object(
+                    menu,
+                    "_read_fallback_project_selector_input",
+                    side_effect=["a", "q"],
+                ):
+                    result = menu._fallback_project_selector()
+
+            self.assertIsNone(result)
+            persist_state.assert_called_once_with(set(), "high")
+
     def test_fallback_selector_reads_arrows_from_dev_tty_when_stdin_is_not_tty(self):
         with tempfile.TemporaryDirectory() as tmp:
             dev = Path(tmp)
@@ -295,13 +342,14 @@ class SessionMenuRunTests(unittest.TestCase):
             tmux.list_sessions.return_value = []
             tmux.get_pane_title.return_value = None
 
-            with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev)}):
+            codex_home = dev / ".codex"
+            with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev), "CODEX_HOME": str(codex_home)}):
                 menu = SessionMenu(tmux)
                 menu._save_runner_prefs({"Blog"}, "high")
                 menu._save_tags({"codex-1": "Session"})
 
-            self.assertTrue((dev / ".codex" / "config" / "runner-prefs.json").exists())
-            self.assertTrue((dev / ".codex" / "session-tags.json").exists())
+            self.assertTrue((codex_home / "config" / "runner-prefs.json").exists())
+            self.assertTrue((codex_home / "session-tags.json").exists())
 
     def test_runner_complexity_pref_is_persisted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -439,6 +487,23 @@ class SessionMenuUiTests(unittest.TestCase):
             result = menu._run_project_selector(fake)
 
         self.assertIsNone(result)
+
+    def test_project_selector_a_toggles_all_off_when_everything_is_selected(self):
+        menu = self._menu()
+        fake = _FakeScreen(keys=[ord("a"), 27])
+        with patch.object(menu, "_get_all_projects", return_value=[("time-track", 3), ("repo", 0)]), patch.object(
+            menu, "_load_runner_prefs", return_value={"time-track", "repo"}
+        ), patch.object(menu, "_load_runner_complexity", return_value="high"), patch.object(
+            menu, "_active_runner_projects", return_value=set()
+        ), patch.object(menu, "_persist_runner_picker_state") as persist_state, patch(
+            "src.menu.curses.curs_set", side_effect=curses.error("unsupported")
+        ), patch(
+            "src.menu.curses.use_default_colors", side_effect=curses.error("unsupported")
+        ):
+            result = menu._run_project_selector(fake)
+
+        self.assertIsNone(result)
+        persist_state.assert_called_once_with(set(), "high")
 
 
 if __name__ == "__main__":
