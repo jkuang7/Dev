@@ -7,7 +7,7 @@ The runner control plane is fully decoupled into three prompts:
 3. `/prompts:run_update`
 
 `cl -> r=runner` must always start with `/prompts:run_execute`.
-It should only dispatch `/prompts:run_update` in a fresh session when execute explicitly requests semantic task-state changes.
+It dispatches `/prompts:run_update` in a fresh session when execute explicitly requests semantic task-state changes or when scripted refresh cannot produce the prepared marker.
 
 ## Minimal User Flow
 
@@ -30,6 +30,7 @@ Runner start is intentionally decoupled:
   - clear-then-setup on normal setup runs
   - setup-only on `--approve-enable <token>` reruns
   - creates fresh runner state
+  - human reset/rebuild path
   - may return an enable approval token
 - `/prompts:run_execute`
   - execute-only worker prompt
@@ -38,8 +39,9 @@ Runner start is intentionally decoupled:
   - terminate the session
 - `/prompts:run_update`
   - semantic post-execute update prompt
-  - used only when execute reported task-state changes that need modeled rewriting
-  - refreshes runner state and writes the prepared marker in its own fresh session
+  - used when execute reported task-state changes that need modeled rewriting or when scripted refresh could not hand off the next cycle
+  - performs in-place backlog repair without wiping runner memory
+  - treats `TASKS.json` as the semantic source of truth; derived runner files stay controller-owned
   - terminate the session
 
 Deprecated:
@@ -53,6 +55,8 @@ Deprecated:
 - Source of truth:
   - `<target-root>/.memory/runner/runtime/RUNNER_STATE.json`
   - `<target-root>/.memory/runner/TASKS.json`
+- Prepared handoff marker:
+  - `<target-root>/.memory/runner/runtime/RUNNER_CYCLE_PREPARED.json`
 - Audit log:
   - `<target-root>/.memory/runner/runtime/RUNNER_LEDGER.ndjson`
 - Scope first:
@@ -84,9 +88,11 @@ Setup requirements:
 - use the latest explicit user request as the source of truth for the seeded objective and bounded tasks
 - seeded tasks must be narrow enough for one bounded runner slice; do not seed umbrella tasks when the request already names smaller concrete surfaces
 - for dependency-heavy migrations, `run_setup` is the strong planning gate: it should split work by file family, safe deprecation phase, and dependency containment before the infinite runner starts
+- `/run_setup` is intentionally reset-oriented: it may clear and regenerate memory files from repo state plus conversation context
 - seeded active tasks should carry `model_profile`, `profile_reason`, `touch_paths`, `validation_commands`, `deprecation_phase`, `fanout_risk`, and optional `spillover_paths`
 - refresh `.memory/runner/*`
 - refresh `RUNNER_EXEC_CONTEXT.json`
+- refresh `RUNNER_ACTIVE_BACKLOG.json`
 - keep `next_task_id` and `next_task` aligned with `TASKS.json`
 - write `RUNNER_HANDOFF.md`
 
@@ -100,22 +106,35 @@ Clear requirements:
 
 `/prompts:run_execute` is the default prompt `r=runner` should drive each cycle.
 `/prompts:run_update` is conditional and should run only when semantic refresh is required.
+`/prompts:run_setup` is for human reset/rebuild only.
 
 `/prompts:run_execute` must:
 - read `.memory/runner/runtime/RUNNER_STATE.json`
 - read `RUNNER_EXEC_CONTEXT.json`
+- read `RUNNER_ACTIVE_BACKLOG.json`
 - resolve phase from explicit `PHASE` or exec context
 - work only within the current phase goal and one coherent medium slice
+- treat `RUNNER_HANDOFF.md` as human/manual recovery context rather than default per-cycle input
 - treat medium slices as execution chunks while keeping the same active `TT-*` until its acceptance is fully satisfied
 - strengthen the active task contract when new in-scope acceptance criteria are discovered instead of silently carrying hidden requirements
 - avoid setup/clear behavior
 - terminate immediately
 
 `/prompts:run_update` must:
-- refresh runner state with quiet setup
+- repair semantic backlog state in `TASKS.json` and only touch `PRD.json` when objective-level wording truly changes
+- preserve the objective and completed history while repairing the active open backlog in place
 - preserve the same active `TT-*` on partial progress and only advance when acceptance is actually cleared or the task must be split into explicit independent blockers
-- write `.memory/runner/runtime/RUNNER_CYCLE_PREPARED.json`
+- default to `mini`, but escalate to `high` when the repair requires broader reseeding, dependency rewrites, or model-profile reclassification
+- keep downstream unmet-dependency tasks `blocked` instead of leaving them `open` for visibility
+- not directly edit `RUNNER_STATE.json`, `RUNNER_EXEC_CONTEXT.json`, `RUNNER_HANDOFF.md`, or `.memory/runner/runtime/RUNNER_CYCLE_PREPARED.json`
 - terminate immediately
+
+No-progress recovery rule:
+- if a cycle cannot produce durable progress, do not keep retrying the same broad task
+- run fresh `/prompts:run_update`
+- let `run_update` tighten, split, or reseed the active backlog in place without clearing full runner memory
+- prefer the smallest truthful recovery: tighten blocker first, split only when families are mixed, and reseed only when the task boundary is genuinely wrong
+- treat coupling as a split trigger: if progress would require crossing into a second family or seam, stop widening and let `run_update` keep that family separate in the next backlog shape
 
 Fail-closed rules:
 - do not hand off after a no-op inspection cycle
@@ -132,7 +151,12 @@ Fail-closed rules:
 - controller dispatches `/prompts:run_execute ...` first
 - after execute, controller scripts deterministic refresh itself with `runctl --setup` and `runctl --prepare-cycle` when no semantic update is needed
 - when execute reports `needs_update=yes`, controller exits the current Codex session and relaunches a fresh session for `/prompts:run_update ...`
+- when scripted refresh fails to produce the prepared marker, controller also relaunches a fresh `/prompts:run_update ...` session
+- after update, controller again scripts deterministic refresh itself with `runctl --setup` and `runctl --prepare-cycle`
 - after scripted refresh or conditional update, controller exits the current Codex session so a fresh TUI session is launched for the next cycle
+- the tmux-codex supervisor archives completed runner threads itself between cycles; prompts must not rely on `::archive`
+- if a `mini` `run_update` still cannot produce the prepared marker, controller retries `run_update` on `high`
+- if a `high` `run_update` still cannot produce the prepared marker, controller stops in an explicit error state instead of hanging or spinning forever
 - controller never dispatches setup or clear
 
 ## Prompt Install Contract

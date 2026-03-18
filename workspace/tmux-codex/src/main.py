@@ -16,6 +16,7 @@ from .runner_loop import (
     ensure_gates_file,
     make_codex_interactive_runner_script,
     resolve_runner_profile,
+    run_runner_archive,
     run_interactive_runner_controller,
     run_loop_worker,
     run_runner_profile,
@@ -518,6 +519,8 @@ def main() -> None:
         raise SystemExit(run_loop_worker(args[1:]))
     if args and args[0] == "__runner-profile":
         raise SystemExit(run_runner_profile(args[1:]))
+    if args and args[0] == "__runner-archive":
+        raise SystemExit(run_runner_archive(args[1:]))
     if args and args[0] == "__runner-controller":
         raise SystemExit(run_interactive_runner_controller(args[1:]))
 

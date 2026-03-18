@@ -62,6 +62,7 @@ class RunnerStatePaths:
     prd_json: Path
     tasks_json: Path
     exec_context_json: Path
+    active_backlog_json: Path
     cycle_prepared_file: Path
     task_intake_file: Path
     runner_log: Path
@@ -119,6 +120,7 @@ def build_runner_state_paths_for_root(
         prd_json=runner_dir / "PRD.json",
         tasks_json=runner_dir / "TASKS.json",
         exec_context_json=runner_dir / "RUNNER_EXEC_CONTEXT.json",
+        active_backlog_json=runner_dir / "RUNNER_ACTIVE_BACKLOG.json",
         cycle_prepared_file=runner_runtime_dir / "RUNNER_CYCLE_PREPARED.json",
         task_intake_file=runner_dir / "RUNNER_TASK_INTAKE.json",
         runner_log=logs_dir / f"runner-{project}.log",
@@ -397,6 +399,7 @@ def managed_runner_files(paths: RunnerStatePaths) -> list[Path]:
         paths.prd_json,
         paths.tasks_json,
         paths.exec_context_json,
+        paths.active_backlog_json,
         paths.cycle_prepared_file,
         paths.task_intake_file,
     ]

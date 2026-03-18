@@ -60,6 +60,7 @@ class RunctlTests(unittest.TestCase):
         self.assertTrue(paths.tasks_json.exists())
         self.assertTrue(paths.prd_json.exists())
         self.assertTrue(paths.exec_context_json.exists())
+        self.assertTrue(paths.active_backlog_json.exists())
         self.assertTrue(paths.ledger_file.exists())
         self.assertTrue(paths.project_prd_file.exists())
         self.assertTrue(paths.runner_handoff_file.exists())
@@ -97,8 +98,12 @@ class RunctlTests(unittest.TestCase):
             if isinstance(entry, dict) and str(entry.get("path", "")).strip()
         }
         self.assertIn(str(paths.project_prd_file.resolve()), source_paths)
-        self.assertIn(str(paths.runner_handoff_file.resolve()), source_paths)
+        self.assertNotIn(str(paths.runner_handoff_file.resolve()), source_paths)
         self.assertIn("Next task:", paths.runner_handoff_file.read_text(encoding="utf-8"))
+        active_backlog = read_json(paths.active_backlog_json)
+        self.assertIsNotNone(active_backlog)
+        assert active_backlog is not None
+        self.assertEqual(active_backlog["next_task_id"], state["next_task_id"])
 
     def test_inspect_runner_start_state_requires_setup(self):
         result = inspect_runner_start_state(str(self.dev), "blog", "main")
@@ -206,6 +211,92 @@ class RunctlTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("no durable progress", result["error"])
         self.assertIn("no_durable_progress_since_cycle_baseline", result["error"])
+
+    def test_inspect_runner_start_state_auto_recovers_runner_update_failure_when_refresh_finds_actionable_task(self):
+        initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        token = initial["enable_token"]
+        approved = create_runner_state(str(self.dev), "blog", "main", approve_enable=token)
+        self.assertTrue(approved["ok"])
+
+        project_root = self.dev / "Repos" / "blog"
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "Already complete",
+                    "status": "done",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+                {
+                    "task_id": "TT-002",
+                    "title": "Recovered actionable task",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": ["TT-001"],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "updated_at": "2026-03-02T00:00:00Z",
+                },
+            ]
+        )
+        paths = self._paths()
+        paths.stop_lock.write_text(
+            "requested_at=2026-03-18T00:00:00Z\n"
+            "source=runner_update_failure\n"
+            "reason=update_exited_without_prepared_marker\n",
+            encoding="utf-8",
+        )
+
+        result = inspect_runner_start_state(str(self.dev), "blog", "main")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["next_task_id"], "TT-002")
+        self.assertFalse(paths.stop_lock.exists())
+
+    def test_inspect_runner_start_state_keeps_update_failure_stop_lock_when_refresh_finds_no_actionable_task(self):
+        initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        token = initial["enable_token"]
+        approved = create_runner_state(str(self.dev), "blog", "main", approve_enable=token)
+        self.assertTrue(approved["ok"])
+
+        project_root = self.dev / "Repos" / "blog"
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "Blocked downstream task",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": ["TT-999"],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+            ]
+        )
+        paths = self._paths()
+        paths.stop_lock.write_text(
+            "requested_at=2026-03-18T00:00:00Z\n"
+            "source=runner_update_failure\n"
+            "reason=update_exited_without_prepared_marker\n",
+            encoding="utf-8",
+        )
+
+        result = inspect_runner_start_state(str(self.dev), "blog", "main")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("missing next-task info", result["error"])
+        self.assertTrue(paths.stop_lock.exists())
 
     def test_inspect_runner_start_state_rejects_blocked_next_task(self):
         initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
@@ -360,6 +451,100 @@ class RunctlTests(unittest.TestCase):
         assert state is not None
         self.assertEqual(state["next_task_id"], "TT-020")
         self.assertEqual(state["next_task"], "Highest priority oldest")
+
+    def test_setup_blocks_unresolved_dependency_tasks_and_keeps_only_actionable_next_task_open(self):
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        project_root = self.dev / "Repos" / "blog"
+
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "First actionable task",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+                {
+                    "task_id": "TT-002",
+                    "title": "Downstream task",
+                    "status": "open",
+                    "priority": "p0",
+                    "depends_on": ["TT-001"],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+            ]
+        )
+
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        paths = self._paths()
+        tasks_payload = read_json(paths.tasks_json)
+        state = read_json(paths.state_file)
+        self.assertIsNotNone(tasks_payload)
+        self.assertIsNotNone(state)
+        assert tasks_payload is not None
+        assert state is not None
+        task_map = {task["task_id"]: task for task in tasks_payload["tasks"]}
+        self.assertEqual(task_map["TT-001"]["status"], "open")
+        self.assertEqual(task_map["TT-002"]["status"], "blocked")
+        self.assertEqual(task_map["TT-002"]["blocked_reason"], "waiting_on: TT-001")
+        self.assertEqual(state["next_task_id"], "TT-001")
+
+    def test_setup_reopens_dependency_blocked_task_when_dependency_is_done(self):
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        project_root = self.dev / "Repos" / "blog"
+
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "Already complete",
+                    "status": "done",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+                {
+                    "task_id": "TT-002",
+                    "title": "Now actionable",
+                    "status": "blocked",
+                    "priority": "p0",
+                    "depends_on": ["TT-001"],
+                    "blocked_reason": "waiting_on: TT-001",
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+            ]
+        )
+
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        paths = self._paths()
+        tasks_payload = read_json(paths.tasks_json)
+        state = read_json(paths.state_file)
+        self.assertIsNotNone(tasks_payload)
+        self.assertIsNotNone(state)
+        assert tasks_payload is not None
+        assert state is not None
+        task_map = {task["task_id"]: task for task in tasks_payload["tasks"]}
+        self.assertEqual(task_map["TT-002"]["status"], "open")
+        self.assertNotIn("blocked_reason", task_map["TT-002"])
+        self.assertEqual(state["next_task_id"], "TT-002")
 
     def test_setup_preserves_task_profile_metadata_and_writes_exec_context_scope(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
@@ -523,7 +708,7 @@ class RunctlTests(unittest.TestCase):
         source_paths = [Path(item["path"]).name for item in exec_context["context_sources"]]
         self.assertEqual(
             source_paths,
-            ["AGENTS.md", "harness.config.json", "golden-path.md", "context-pack.md", "context-pack.json", "PRD.md", "RUNNER_HANDOFF.md"],
+            ["AGENTS.md", "harness.config.json", "golden-path.md", "context-pack.md", "context-pack.json", "PRD.md"],
         )
         self.assertEqual(exec_context["phase"], "discover")
 
@@ -551,7 +736,7 @@ class RunctlTests(unittest.TestCase):
         source_paths = [Path(item["path"]).name for item in exec_context["context_sources"]]
         self.assertEqual(
             source_paths,
-            ["AGENTS.md", "context-pack.md", "context-pack.json", "harness.config.json", "golden-path.md", "PRD.md", "RUNNER_HANDOFF.md"],
+            ["AGENTS.md", "context-pack.md", "context-pack.json", "harness.config.json", "golden-path.md", "PRD.md"],
         )
 
     def test_setup_promotes_verify_phase_when_blocker_surface_is_validation(self):
@@ -740,6 +925,7 @@ class RunctlTests(unittest.TestCase):
         self.assertFalse(paths.project_prd_file.exists())
         self.assertFalse(paths.legacy_refactor_status_file.exists())
         self.assertFalse(paths.runner_handoff_file.exists())
+        self.assertFalse(paths.active_backlog_json.exists())
 
     def test_setup_refresh_drops_legacy_conversation_digest_fields(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
@@ -1006,6 +1192,73 @@ class RunctlTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("no durable progress", mocked_stdout.getvalue())
         self.assertFalse(paths.cycle_prepared_file.exists())
+
+    def test_prepare_cycle_accepts_same_next_task_when_active_backlog_digest_changes(self):
+        project_root = self.dev / "Repos" / "blog"
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "Primary active task",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["original acceptance"],
+                    "validation": ["original validation"],
+                    "updated_at": "2026-03-18T00:00:00Z",
+                },
+                {
+                    "task_id": "TT-002",
+                    "title": "Downstream task",
+                    "status": "blocked",
+                    "priority": "p1",
+                    "depends_on": ["TT-001"],
+                    "blocked_reason": "waiting_on: TT-001",
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["later"],
+                    "validation": ["later verify"],
+                    "updated_at": "2026-03-18T00:00:00Z",
+                },
+            ]
+        )
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        paths = self._paths()
+        before_exec_context = read_json(paths.exec_context_json)
+        self.assertIsNotNone(before_exec_context)
+        assert before_exec_context is not None
+        baseline = before_exec_context.get("cycle_progress_baseline")
+        self.assertIsInstance(baseline, dict)
+
+        tasks_payload = read_json(paths.tasks_json)
+        self.assertIsNotNone(tasks_payload)
+        assert tasks_payload is not None
+        tasks_payload["tasks"][0]["acceptance"] = ["rewritten acceptance after semantic split"]
+        tasks_payload["tasks"][1]["title"] = "Blocked child split from same active task"
+        write_json(paths.tasks_json, tasks_payload)
+
+        setup_code = run(["--setup", "--project", "blog", "--runner-id", "main", "--dev", str(self.dev), "--quiet"])
+        self.assertEqual(setup_code, 0)
+
+        refreshed_exec_context = read_json(paths.exec_context_json)
+        self.assertIsNotNone(refreshed_exec_context)
+        assert refreshed_exec_context is not None
+        refreshed_baseline = refreshed_exec_context.get("cycle_progress_baseline")
+        refreshed_progress = refreshed_exec_context.get("progress_baseline")
+        self.assertIsInstance(refreshed_baseline, dict)
+        self.assertIsInstance(refreshed_progress, dict)
+        self.assertEqual(refreshed_exec_context["next_task_id"], "TT-001")
+        self.assertEqual(refreshed_baseline["next_task_id"], baseline["next_task_id"])
+        self.assertEqual(refreshed_baseline["worktree_fingerprint"], baseline["worktree_fingerprint"])
+        self.assertEqual(refreshed_baseline["active_backlog_digest"], baseline["active_backlog_digest"])
+        self.assertNotEqual(refreshed_progress["active_backlog_digest"], baseline["active_backlog_digest"])
+
+        prepare_code = run(["--prepare-cycle", "--project", "blog", "--runner-id", "main", "--dev", str(self.dev)])
+        self.assertEqual(prepare_code, 0)
+        self.assertTrue(paths.cycle_prepared_file.exists())
 
     def test_worktree_fingerprint_changes_for_untracked_file_content_edits(self):
         project_root = self.dev / "Repos" / "blog"

@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from .codex_threads import archive_runner_threads_for_cwd
 from .codex_engine import CodexRunResult, run_codex_iteration
 from .hooks import HookAdapter, LocalHooks, load_agents_bridge
 from .runctl import create_runner_state, resolve_target_project_root
@@ -139,6 +140,13 @@ def _normalize_task_model_profile(raw: object) -> str | None:
     return None
 
 
+def _normalize_scope_status(raw: object) -> str:
+    candidate = str(raw or "").strip().lower()
+    if candidate in {"ok", "narrow", "split", "reseed"}:
+        return candidate
+    return "ok"
+
+
 def _pending_update_profile_from_state(state: dict[str, object] | None) -> str | None:
     if not isinstance(state, dict):
         return None
@@ -162,11 +170,13 @@ def _parse_execute_update_request(text: str) -> dict[str, str | bool]:
     needs_update = _parse_status_directive(text, "needs_update")
     update_profile = _normalize_task_model_profile(_parse_status_directive(text, "update_profile"))
     update_reason = _parse_status_directive(text, "update_reason")
+    scope_status = _normalize_scope_status(_parse_status_directive(text, "scope_status"))
     requested = needs_update == "yes"
     return {
         "needs_update": requested,
         "update_profile": update_profile or "mini",
         "update_reason": update_reason or "",
+        "scope_status": scope_status,
     }
 
 
@@ -299,6 +309,27 @@ def _run_scripted_cycle_refresh(
     except Exception as exc:  # pylint: disable=broad-exception-caught
         return False, f"refresh_exception:{type(exc).__name__}: {exc}"
     return True, None
+
+
+def _write_runner_stop_lock(
+    *,
+    state_paths: RunnerStatePaths,
+    source: str,
+    reason: str,
+    phase: str,
+    session_name: str,
+) -> None:
+    state_paths.stop_lock.parent.mkdir(parents=True, exist_ok=True)
+    state_paths.stop_lock.write_text(
+        (
+            f"requested_at={utc_now()}\n"
+            f"source={source}\n"
+            f"reason={reason}\n"
+            f"phase={phase}\n"
+            f"session={session_name}\n"
+        ),
+        encoding="utf-8",
+    )
 
 
 def render_runner_profile_shell_exports(profile: dict[str, str | None]) -> str:
@@ -796,6 +827,18 @@ while true; do
   CONTROLLER_RC=$?
   log_supervisor "cycle ended codex_rc=$CODEX_RC controller_rc=$CONTROLLER_RC"
 
+  ARCHIVE_SUMMARY=$(cd {q_repo_home} && PYTHONPATH={q_repo_home}${{PYTHONPATH:+:$PYTHONPATH}} python3 -m src.main __runner-archive \
+    --project-root "$PROJECT_ROOT" \
+    --keep 0 \
+    --format text 2>>"$RUNNER_LOG")
+  ARCHIVE_RC=$?
+  if [[ -n "$ARCHIVE_SUMMARY" ]]; then
+    log_supervisor "$ARCHIVE_SUMMARY"
+  fi
+  if [[ $ARCHIVE_RC -ne 0 ]]; then
+    log_supervisor "runner thread archive failed rc=$ARCHIVE_RC"
+  fi
+
   if [[ -f "$STOP_LOCK" || -f "$DONE_LOCK" ]]; then
     log_supervisor "lock detected after cycle; stopping infinite runner"
     break
@@ -953,7 +996,7 @@ Rules:
 3. Do not create the done lock early.
 4. Before creating done lock, source .memory/gates.sh and run run_gates.
 5. Only create done lock if run_gates succeeds and .memory/runner/TASKS.json has zero tasks in open|in_progress|blocked.
-6. Use .memory/runner/RUNNER_EXEC_CONTEXT.json plus .memory/runner/RUNNER_HANDOFF.md and runner state to respect the current phase goal and next task.
+6. Use .memory/runner/RUNNER_EXEC_CONTEXT.json plus .memory/runner/RUNNER_ACTIVE_BACKLOG.json and runner state to respect the current phase goal and next task. Treat RUNNER_HANDOFF.md as human/manual recovery context, not default per-cycle input.
 7. End your response with this exact machine-parsable block:
 RUNNER_UPDATE_START
 {{"summary":"...","completed":["..."],"completed_task_ids":["TT-..."],"next_task":"...","next_task_reason":"...","blockers":["..."],"remaining_gaps":["..."],"done_candidate":false}}
@@ -1735,6 +1778,31 @@ def run_runner_profile(argv: list[str]) -> int:
     return 0
 
 
+def parse_runner_archive_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Archive runner-generated Codex threads for one cwd")
+    parser.add_argument("--project-root", required=True)
+    parser.add_argument("--keep", type=int, default=0)
+    parser.add_argument("--format", choices=("json", "text"), default="text")
+    return parser.parse_args(argv)
+
+
+def run_runner_archive(argv: list[str]) -> int:
+    args = parse_runner_archive_args(argv)
+    summary = archive_runner_threads_for_cwd(
+        cwd=Path(args.project_root).expanduser().resolve(),
+        keep=max(0, args.keep),
+    )
+    if args.format == "json":
+        print(json.dumps(summary))
+    else:
+        print(
+            "runner_thread_archive "
+            f"matched={summary['matched']} kept={summary['kept']} "
+            f"archived={summary['archived']} failed={summary['failed']}"
+        )
+    return 0 if int(summary.get("failed") or 0) == 0 else 1
+
+
 def parse_runner_controller_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Internal infinite runner controller")
     parser.add_argument("--project", required=True)
@@ -1786,13 +1854,6 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
     dispatched_at = 0.0
     saw_busy = False
     idle_since: float | None = None
-    update_marker_observed = False
-    update_marker_mtime = (
-        state_paths.cycle_prepared_file.stat().st_mtime
-        if state_paths.cycle_prepared_file.exists()
-        else 0.0
-    )
-
     try:
         while True:
             if not tmux.has_session(session_name):
@@ -1851,13 +1912,6 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
             if in_flight:
                 if pane_state != "idle":
                     saw_busy = True
-                current_marker_mtime = (
-                    state_paths.cycle_prepared_file.stat().st_mtime
-                    if state_paths.cycle_prepared_file.exists()
-                    else 0.0
-                )
-                if active_step == "update" and current_marker_mtime != update_marker_mtime:
-                    update_marker_observed = True
                 prompt_completed = False
                 if pane_state == "idle" and completion_idle_grace_satisfied:
                     lower_output = output.lower()
@@ -1886,6 +1940,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                     if bool(update_request.get("needs_update")):
                         update_profile = str(update_request.get("update_profile") or "mini")
                         update_reason = str(update_request.get("update_reason") or "").strip()
+                        scope_status = str(update_request.get("scope_status") or "ok")
                         state = update_state(
                             state_paths.state_file,
                             state,
@@ -1898,6 +1953,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                             phase=injected_phase,
                             update_profile=update_profile,
                             update_reason=update_reason or None,
+                            scope_status=scope_status,
                         )
                         _log_line(
                             state_paths,
@@ -1978,19 +2034,119 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                     )
                     return 0
 
-                if prompt_completed and active_step == "update" and update_marker_observed:
-                    update_marker_mtime = current_marker_mtime
-                    update_marker_observed = False
+                if prompt_completed and active_step == "update":
+                    scope_status = _normalize_scope_status(_parse_status_directive(output, "scope_status"))
+                    active_update_profile = pending_update_profile or "mini"
+                    refresh_ok, refresh_error = _run_scripted_cycle_refresh(
+                        dev=dev,
+                        project=project,
+                        runner_id=runner_id,
+                        project_root=project_root,
+                    )
+                    if refresh_ok:
+                        _append_ledger(
+                            state_paths,
+                            "runner.update_complete",
+                            phase=injected_phase,
+                            scope_status=scope_status,
+                        )
+                        _log_line(
+                            state_paths,
+                            (
+                                f"Update completed for phase={injected_phase}; controller refresh succeeded "
+                                "and the next loop will restart fresh"
+                            ),
+                        )
+                        eof_sent = tmux.send_eof(session_name)
+                        if not eof_sent:
+                            _append_ledger(
+                                state_paths,
+                                "runner.chat_exit_failed",
+                                phase=injected_phase,
+                                session_name=session_name,
+                            )
+                            _log_line(
+                                state_paths,
+                                f"Prepared marker observed for phase={injected_phase}, but failed to exit Codex chat cleanly",
+                            )
+                            state = update_state(state_paths.state_file, state, status="error", current_step="")
+                            return 1
+
+                        _append_ledger(
+                            state_paths,
+                            "runner.chat_exit_requested",
+                            phase=injected_phase,
+                            session_name=session_name,
+                        )
+                        _log_line(
+                            state_paths,
+                            f"Requested Codex chat exit after update for phase={injected_phase}; next loop will relaunch fresh",
+                        )
+                        state = update_state(state_paths.state_file, state, status="running", current_step="")
+                        return 0
+                    failure_reason = refresh_error or "scripted_refresh_failed_after_update"
                     _append_ledger(
                         state_paths,
-                        "runner.update_complete",
+                        "runner.update_prepare_failed",
                         phase=injected_phase,
-                        prepared_at=current_marker_mtime,
+                        session_name=session_name,
+                        reason=failure_reason,
+                        scope_status=scope_status,
+                        update_profile=active_update_profile,
                     )
-                    _log_line(
-                        state_paths,
-                        f"Update completed for phase={injected_phase}; prepared marker observed and exiting Codex so the next loop restarts fresh",
-                    )
+                    if active_update_profile != "high":
+                        state = update_state(
+                            state_paths.state_file,
+                            state,
+                            status="running",
+                            current_step=f"{RUNNER_UPDATE_PENDING_PREFIX}:high",
+                        )
+                        _append_ledger(
+                            state_paths,
+                            "runner.update_retry_requested",
+                            phase=injected_phase,
+                            session_name=session_name,
+                            from_profile=active_update_profile,
+                            to_profile="high",
+                            reason=failure_reason,
+                            scope_status=scope_status,
+                        )
+                        _log_line(
+                            state_paths,
+                            (
+                                f"Update completed for phase={injected_phase} but scripted refresh still failed; "
+                                "scheduling a fresh high run_update recovery cycle"
+                            ),
+                        )
+                    else:
+                        _write_runner_stop_lock(
+                            state_paths=state_paths,
+                            source="runner_update_failure",
+                            reason=failure_reason,
+                            phase=injected_phase,
+                            session_name=session_name,
+                        )
+                        state = update_state(
+                            state_paths.state_file,
+                            state,
+                            status="error",
+                            current_step="",
+                        )
+                        _append_ledger(
+                            state_paths,
+                            "runner.update_retry_exhausted",
+                            phase=injected_phase,
+                            session_name=session_name,
+                            reason=failure_reason,
+                            scope_status=scope_status,
+                        )
+                        _log_line(
+                            state_paths,
+                            (
+                                f"High run_update finished for phase={injected_phase} but scripted refresh still failed; "
+                                "stopping the infinite runner with an explicit recovery error"
+                            ),
+                        )
                     eof_sent = tmux.send_eof(session_name)
                     if not eof_sent:
                         _append_ledger(
@@ -2001,11 +2157,10 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         )
                         _log_line(
                             state_paths,
-                            f"Prepared marker observed for phase={injected_phase}, but failed to exit Codex chat cleanly",
+                            f"Update refresh failed for phase={injected_phase}, and Codex chat exit also failed",
                         )
                         state = update_state(state_paths.state_file, state, status="error", current_step="")
                         return 1
-
                     _append_ledger(
                         state_paths,
                         "runner.chat_exit_requested",
@@ -2014,10 +2169,12 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                     )
                     _log_line(
                         state_paths,
-                        f"Requested Codex chat exit after update for phase={injected_phase}; next loop will relaunch fresh",
+                        (
+                            f"Requested Codex chat exit after update refresh failure for phase={injected_phase}; "
+                            f"next recovery step is {'fresh high run_update' if active_update_profile != 'high' else 'runner error stop'}"
+                        ),
                     )
-                    state = update_state(state_paths.state_file, state, status="running", current_step="")
-                    return 0
+                    return 0 if active_update_profile != "high" else 1
 
             if not in_flight and pane_state == "idle" and dispatch_idle_grace_satisfied:
                 active_profile = resolve_active_task_execution_profile(

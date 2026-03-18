@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -16,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.codex_engine import CodexRunResult
+from src.codex_threads import archive_runner_threads_for_cwd, is_runner_thread
 from src.main import parse_loop_args
 from src.runner_loop import (
     _build_prompt,
@@ -114,6 +114,8 @@ class LoopScriptTests(unittest.TestCase):
         self.assertIn('codex --search --dangerously-bypass-approvals-and-sandbox', script)
         self.assertIn('cycle controller pid=', script)
         self.assertIn('cycle ended codex_rc=', script)
+        self.assertIn('python3 -m src.main __runner-archive', script)
+        self.assertIn('ARCHIVE_SUMMARY=', script)
         self.assertIn('exec zsh -l', script)
         self.assertIn('python3 -m src.main __runner-profile', script)
         self.assertIn('RUNNER_MODEL=gpt-5.1-codex', script)
@@ -247,6 +249,47 @@ class LoopScriptTests(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(calls, [("gpt-5.4-mini", "medium"), ("gpt-5.4", "high")])
+
+    def test_archive_runner_threads_for_cwd_archives_only_runner_threads(self):
+        threads = [
+            {
+                "id": "runner-new",
+                "cwd": "/tmp/blog",
+                "preview": "Use this command to execute exactly one medium bounded infinite-runner work slice.",
+                "updatedAt": 20,
+                "createdAt": 10,
+            },
+            {
+                "id": "runner-old",
+                "cwd": "/tmp/blog",
+                "preview": "Use this command to refresh infinite-runner state after one execute slice finishes.",
+                "updatedAt": 10,
+                "createdAt": 9,
+            },
+            {
+                "id": "manual-thread",
+                "cwd": "/tmp/blog",
+                "preview": "Investigate prod bug",
+                "updatedAt": 30,
+                "createdAt": 30,
+            },
+        ]
+
+        archived_ids: list[str] = []
+
+        with (
+            patch("src.codex_threads.list_threads_for_cwd", return_value=threads),
+            patch("src.codex_threads.archive_thread", side_effect=lambda thread_id: archived_ids.append(thread_id)),
+        ):
+            summary = archive_runner_threads_for_cwd(cwd=Path("/tmp/blog"), keep=1)
+
+        self.assertTrue(is_runner_thread(threads[0]))
+        self.assertTrue(is_runner_thread(threads[1]))
+        self.assertFalse(is_runner_thread(threads[2]))
+        self.assertEqual(summary["matched"], 2)
+        self.assertEqual(summary["kept"], 1)
+        self.assertEqual(summary["archived"], 1)
+        self.assertEqual(archived_ids, ["runner-old"])
 
     def test_module_entrypoint_executes_main(self):
         result = subprocess.run(
@@ -540,9 +583,6 @@ class LoopScriptTests(unittest.TestCase):
             state["current_step"] = "update_pending:mini"
             write_json(paths.state_file, state)
             write_json(paths.exec_context_json, {"phase": "implement"})
-            marker_path = paths.cycle_prepared_file
-            marker_path.write_text("{}", encoding="utf-8")
-            initial_marker_mtime = marker_path.stat().st_mtime
 
             tmux_instance = unittest.mock.Mock()
             tmux_instance.has_session.side_effect = repeat(True)
@@ -553,19 +593,14 @@ class LoopScriptTests(unittest.TestCase):
                 patch("src.runner_loop.resolve_target_project_root", return_value=project_root),
                 patch("src.runner_loop.TmuxClient", return_value=tmux_instance),
                 patch("src.runner_loop._submit_runner_prompt", return_value=(True, None)) as submit_prompt,
+                patch("src.runner_loop._run_scripted_cycle_refresh", return_value=(True, None)) as scripted_refresh,
                 patch("src.runner_loop.time.sleep", return_value=None),
             ):
-                def capture_side_effect(*_args, **_kwargs):
-                    count = tmux_instance.capture_pane.call_count
-                    if count == 1:
-                        return "OpenAI Codex\n› Run /review on my current changes\n"
-                    if count == 2:
-                        return "Running update...\n"
-                    marker_path.write_text('{\"prepared_at\":\"later\"}', encoding='utf-8')
-                    os.utime(marker_path, (initial_marker_mtime + 5, initial_marker_mtime + 5))
-                    return "OpenAI Codex\n› \nstate_refreshed=yes\nprepared_marker=yes\nexiting=yes\n"
-
-                tmux_instance.capture_pane.side_effect = capture_side_effect
+                tmux_instance.capture_pane.side_effect = [
+                    "OpenAI Codex\n› Run /review on my current changes\n",
+                    "Running update...\n",
+                    "OpenAI Codex\n› \nstate_repaired=yes\nscope_status=narrow\nexiting=yes\n",
+                ]
 
                 rc = run_interactive_runner_controller(
                     [
@@ -585,6 +620,7 @@ class LoopScriptTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(submit_prompt.call_count, 1)
             self.assertIn("/prompts:run_update", submit_prompt.call_args.kwargs["command"])
+            scripted_refresh.assert_called_once()
             self.assertTrue(tmux_instance.send_eof.called)
             state = read_json(paths.state_file)
             self.assertEqual(state.get("current_step"), "")
@@ -596,6 +632,153 @@ class LoopScriptTests(unittest.TestCase):
             self.assertIn("runner.update_dispatch_start", ledger_events)
             self.assertIn("runner.update_dispatch_sent", ledger_events)
             self.assertIn("runner.update_complete", ledger_events)
+            self.assertIn("runner.chat_exit_requested", ledger_events)
+
+    def test_interactive_runner_controller_retries_high_update_when_mini_update_refresh_still_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            project_root = dev / "Repos" / "blog"
+            project_root.mkdir(parents=True)
+            paths = build_runner_state_paths_for_root(
+                project_root=project_root,
+                dev=str(dev),
+                project="blog",
+                runner_id="main",
+            )
+            paths.runner_dir.mkdir(parents=True, exist_ok=True)
+            state = default_runner_state("blog", "main")
+            state["current_step"] = "update_pending:mini"
+            write_json(paths.state_file, state)
+            write_json(paths.exec_context_json, {"phase": "verify"})
+
+            tmux_instance = unittest.mock.Mock()
+            tmux_instance.has_session.side_effect = repeat(True)
+            tmux_instance.get_pane_process.side_effect = repeat("node")
+            tmux_instance.send_eof.return_value = True
+
+            with (
+                patch("src.runner_loop.resolve_target_project_root", return_value=project_root),
+                patch("src.runner_loop.TmuxClient", return_value=tmux_instance),
+                patch("src.runner_loop._submit_runner_prompt", return_value=(True, None)) as submit_prompt,
+                patch(
+                    "src.runner_loop._run_scripted_cycle_refresh",
+                    return_value=(False, "prepare_failed:ERROR: refusing to prepare cycle marker because no durable progress was detected since RUNNER_EXEC_CONTEXT.json"),
+                ) as scripted_refresh,
+                patch("src.runner_loop.time.sleep", return_value=None),
+            ):
+                tmux_instance.capture_pane.side_effect = [
+                    "OpenAI Codex\n› Run /review on my current changes\n",
+                    "Running update...\n",
+                    "OpenAI Codex\n› \nstate_repaired=yes\nscope_status=reseed\nexiting=yes\n",
+                ]
+
+                rc = run_interactive_runner_controller(
+                    [
+                        "--project",
+                        "blog",
+                        "--runner-id",
+                        "main",
+                        "--session-name",
+                        "runner-blog",
+                        "--dev",
+                        str(dev),
+                        "--poll-seconds",
+                        "0",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(submit_prompt.call_count, 1)
+            self.assertIn("/prompts:run_update", submit_prompt.call_args.kwargs["command"])
+            scripted_refresh.assert_called_once()
+            self.assertTrue(tmux_instance.send_eof.called)
+            state = read_json(paths.state_file)
+            self.assertEqual(state.get("status"), "running")
+            self.assertEqual(state.get("current_step"), "update_pending:high")
+            self.assertFalse(paths.stop_lock.exists())
+            ledger_events = [
+                json.loads(line)["event"]
+                for line in paths.ledger_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertIn("runner.update_dispatch_start", ledger_events)
+            self.assertIn("runner.update_dispatch_sent", ledger_events)
+            self.assertIn("runner.update_prepare_failed", ledger_events)
+            self.assertIn("runner.update_retry_requested", ledger_events)
+            self.assertIn("runner.chat_exit_requested", ledger_events)
+
+    def test_interactive_runner_controller_stops_with_error_when_high_update_refresh_still_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            project_root = dev / "Repos" / "blog"
+            project_root.mkdir(parents=True)
+            paths = build_runner_state_paths_for_root(
+                project_root=project_root,
+                dev=str(dev),
+                project="blog",
+                runner_id="main",
+            )
+            paths.runner_dir.mkdir(parents=True, exist_ok=True)
+            state = default_runner_state("blog", "main")
+            state["current_step"] = "update_pending:high"
+            write_json(paths.state_file, state)
+            write_json(paths.exec_context_json, {"phase": "verify"})
+
+            tmux_instance = unittest.mock.Mock()
+            tmux_instance.has_session.side_effect = repeat(True)
+            tmux_instance.get_pane_process.side_effect = repeat("node")
+            tmux_instance.send_eof.return_value = True
+
+            with (
+                patch("src.runner_loop.resolve_target_project_root", return_value=project_root),
+                patch("src.runner_loop.TmuxClient", return_value=tmux_instance),
+                patch("src.runner_loop._submit_runner_prompt", return_value=(True, None)) as submit_prompt,
+                patch(
+                    "src.runner_loop._run_scripted_cycle_refresh",
+                    return_value=(False, "prepare_failed:ERROR: refusing to prepare cycle marker because no durable progress was detected since RUNNER_EXEC_CONTEXT.json"),
+                ) as scripted_refresh,
+                patch("src.runner_loop.time.sleep", return_value=None),
+            ):
+                tmux_instance.capture_pane.side_effect = [
+                    "OpenAI Codex\n› Run /review on my current changes\n",
+                    "Running update...\n",
+                    "OpenAI Codex\n› \nstate_repaired=yes\nscope_status=reseed\nexiting=yes\n",
+                ]
+
+                rc = run_interactive_runner_controller(
+                    [
+                        "--project",
+                        "blog",
+                        "--runner-id",
+                        "main",
+                        "--session-name",
+                        "runner-blog",
+                        "--dev",
+                        str(dev),
+                        "--poll-seconds",
+                        "0",
+                    ]
+                )
+
+            self.assertEqual(rc, 1)
+            self.assertEqual(submit_prompt.call_count, 1)
+            self.assertIn("/prompts:run_update", submit_prompt.call_args.kwargs["command"])
+            scripted_refresh.assert_called_once()
+            self.assertTrue(tmux_instance.send_eof.called)
+            state = read_json(paths.state_file)
+            self.assertEqual(state.get("status"), "error")
+            self.assertEqual(state.get("current_step"), "")
+            self.assertTrue(paths.stop_lock.exists())
+            stop_text = paths.stop_lock.read_text(encoding="utf-8")
+            self.assertIn("source=runner_update_failure", stop_text)
+            self.assertIn("reason=prepare_failed:ERROR: refusing to prepare cycle marker because no durable progress was detected since RUNNER_EXEC_CONTEXT.json", stop_text)
+            ledger_events = [
+                json.loads(line)["event"]
+                for line in paths.ledger_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertIn("runner.update_prepare_failed", ledger_events)
+            self.assertIn("runner.update_retry_exhausted", ledger_events)
             self.assertIn("runner.chat_exit_requested", ledger_events)
 
     def test_submit_runner_prompt_retries_after_empty_placeholder_expansion(self):
@@ -817,7 +1000,8 @@ class LoopPromptTests(unittest.TestCase):
             prompt = _build_prompt(project="blog", runner_id="main", paths=paths)
 
         self.assertIn(f"Runner state file: {paths.state_file}", prompt)
-        self.assertIn("Use .memory/runner/RUNNER_EXEC_CONTEXT.json plus .memory/runner/RUNNER_HANDOFF.md and runner state to respect the current phase goal and next task.", prompt)
+        self.assertIn("Use .memory/runner/RUNNER_EXEC_CONTEXT.json plus .memory/runner/RUNNER_ACTIVE_BACKLOG.json and runner state to respect the current phase goal and next task.", prompt)
+        self.assertIn("Treat RUNNER_HANDOFF.md as human/manual recovery context", prompt)
 
 
 class LoopLoggingTests(unittest.TestCase):

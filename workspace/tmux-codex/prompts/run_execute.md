@@ -23,12 +23,14 @@ Resolve target root in this order:
 Read:
 - `<target_root>/.memory/runner/runtime/RUNNER_STATE.json`
 - `<target_root>/.memory/runner/RUNNER_EXEC_CONTEXT.json`
+- `<target_root>/.memory/runner/RUNNER_ACTIVE_BACKLOG.json`
 
 Resolve phase from:
 1. explicit `PHASE=<phase>`
 2. `RUNNER_EXEC_CONTEXT.json.phase`
 
-Load only the compact `context_sources` and `context_delta` from `RUNNER_EXEC_CONTEXT.json` before extra repo reads.
+Load only the compact `context_sources` and `context_delta` from `RUNNER_EXEC_CONTEXT.json` plus `RUNNER_ACTIVE_BACKLOG.json` before extra repo reads.
+Treat `RUNNER_HANDOFF.md` as human/manual recovery context, not default per-cycle input.
 Use the active task metadata in `RUNNER_EXEC_CONTEXT.json` as hard scope:
 
 - `model_profile`
@@ -92,10 +94,20 @@ When the bounded work slice is done:
 - if the slice was forced to stop because the declared scope was too narrow, say so explicitly so `run_update` can split or escalate it cleanly
 - set `needs_update=yes` only when semantic task metadata must change: new blocker family, scope creep, task split, mini->high escalation, or acceptance/validation rewrite
 - default `needs_update=no` when deterministic refresh plus prepared-marker handoff is enough
+- add `scope_status` so the runner can tell whether the current task shape is still valid:
+  - `scope_status=ok` when the task shape still matches the real work surface
+  - `scope_status=narrow` when the same `TT-*` should stay active but its blocker needs tighter wording
+  - `scope_status=split` when the task bundles multiple file families or seams and should be split
+  - `scope_status=reseed` when the active open backlog is broad enough that fresh `run_update` on the stronger model must reseed it in place before the loop should continue
+- choose the least disruptive truthful value: prefer `narrow` over `split`, and `split` over `reseed`, unless the task boundary is genuinely wrong
+- do not overuse `scope_status=reseed`; use it only when the task shape is wrong, not merely because the current work is hard or validation failed once
+- if the active task bundles multiple real file families such as `useAppLayoutStore*` plus `useAppStore*`, do not keep pushing implementation and call that out with `scope_status=split` or `scope_status=reseed`
+- if the current task cannot produce durable progress without widening across a seam or second subsystem, prefer `scope_status=reseed` over another approximate retry so the next fresh `run_update` can reseed the active backlog
+- if implementation starts pulling in files named in `spillover_paths` or implied by `coupling_notes`, stop and report that boundary instead of absorbing the coupled work into the same slice
 - report compact operational output
 - terminate this Codex chat session immediately
 
-The runner controller will script deterministic refresh itself after this prompt completes. It will only invoke `/prompts:run_update` in a separate fresh session when your output explicitly says semantic task-state changes are needed.
+The runner controller will script deterministic refresh itself after this prompt completes. It will invoke `/prompts:run_update` in a separate fresh session when your output explicitly says semantic task-state changes are needed or when scripted refresh cannot produce the prepared marker.
 
 ## Output
 
@@ -105,5 +117,6 @@ End with:
 - `phase_done=<yes|no>`
 - `validation=<pass|fail>`
 - `needs_update=<yes|no>`
+- `scope_status=<ok|narrow|split|reseed>`
 - if `needs_update=yes`, optionally add `update_profile=<mini|high>`; omit it unless the update truly needs `high`
 - `exiting=<yes>`

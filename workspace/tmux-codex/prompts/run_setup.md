@@ -1,5 +1,7 @@
 Use this command to prepare Codex infinite-runner state for the current repo/worktree.
 
+This is the human reset/rebuild path. On normal runs it clears runner memory, then regenerates runner state from repo evidence plus the current conversation context.
+
 Runner context from `/prompts:run_setup` args:
 - `DEV=$DEV`
 - `PROJECT=$PROJECT`
@@ -54,7 +56,7 @@ Use the latest explicit user goal as the source of truth. Distill broad notes in
 - 1-3 bounded open tasks
 - acceptance and validation that name the real blocker or parity target
 
-For dependency-heavy migration work, `run_setup` is the strong planning gate:
+For dependency-heavy migration work, `run_setup` is the strong human-invoked planning gate:
 
 - assume `run_setup` is the expensive planning step and use `gpt-5.4` with `high` reasoning here
 - do the dependency analysis here before the infinite runner starts
@@ -78,6 +80,13 @@ Deep-analysis grouping rules:
 - if a candidate slice mixes seam creation with removal, split it into separate phased tasks
 - if a candidate slice would require touching files outside its declared scope to finish cleanly, split it before setup completes
 - if unrelated dirty files are present, keep them out of `touch_paths` and call them out explicitly in `coupling_notes` rather than silently absorbing them into the slice
+- if the human is rerunning setup after a stalled runner, do not reseed the same broad task unchanged; narrow or split the stalled task before the loop resumes
+- use the smallest regrouping needed to restore momentum; do not oversplit healthy tasks that are still producing durable progress
+- preserve a healthy task unchanged when its family boundary is still correct and only the blocker needs tighter wording
+- if a stalled task still says `finish remaining`, `finish the rest`, or otherwise bundles multiple file families, replace it with narrower child tasks instead of preserving the umbrella wording
+- if a stalled task mixes hook/store families such as `useAppLayoutStore*` plus `useAppStore*`, split those families before re-enabling the loop
+- if the current dirty worktree concentration is already centered on one of those families, seed that real in-flight family first instead of forcing another wide task boundary
+- do not seed one task across multiple dominant dependency clusters just because the files are nearby; if coupling notes point to a second family or seam, split at that boundary before setup completes
 
 Model-efficient seeding rules:
 
@@ -110,6 +119,9 @@ Task seeding must be narrow enough for a single runner slice:
 - split umbrella work into ordered tasks instead of one broad task
 - group file changes so each task owns one coherent file family and one destination seam
 - reject or split tasks that mix seam creation with cleanup/removal, mix app-shell with core-store, or require edits outside their proposed scope
+- prefer narrower `touch_paths` over umbrella titles like `finish remaining wrappers`; if a stalled task cannot be explained as one coherent family, split it now
+- `time-track` fixture rule: if a stalled task bundles both `desktop/src/app-layout/useAppLayoutStore*` and `desktop/src/app-store/useAppStore*`, reseed them as separate follow-up tasks instead of retrying the mixed slice
+- treat `coupling_notes`, `fanout_risk`, and `spillover_paths` as hard evidence, not commentary: if they show another family would likely be touched, keep that family out of the slice or create a separate task for it
 
 For every seeded task:
 
@@ -139,6 +151,7 @@ Instead, name the first concrete slice, for example:
 Do not preserve generic boilerplate when the user has already provided a specific plan.
 Do not preserve broad umbrella tasks when the user has already provided enough detail to split them.
 Do not preserve weak acceptance criteria when the user has described a strict parity target.
+Do not use this prompt as the infinite runner's automatic recovery step; that belongs to `/prompts:run_update`.
 
 ## Command
 

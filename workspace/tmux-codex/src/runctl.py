@@ -618,7 +618,6 @@ def _collect_context_sources(project_root: Path) -> list[dict[str, Any]]:
     memory_dir = project_root / ".memory"
     _add(memory_dir / "PRD.md", kind="repo_prd")
     _add(memory_dir / "lessons.md", kind="repo_lessons")
-    _add(memory_dir / "runner" / "RUNNER_HANDOFF.md", kind="runner_handoff")
     if not (memory_dir / "PRD.md").exists():
         _add(memory_dir / "REFRACTOR_STATUS.md", kind="legacy_repo_prd")
 
@@ -745,6 +744,93 @@ def _sync_runner_handoff_file(
         lines.extend(["", "## Remaining Open Tasks", ""])
         lines.extend([f"- {item}" for item in open_items])
     paths.runner_handoff_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _build_active_backlog_entries(
+    *,
+    tasks_payload: dict[str, Any],
+    selected_task_id: str,
+    max_items: int = 4,
+) -> list[dict[str, Any]]:
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for raw in tasks:
+        if not isinstance(raw, dict):
+            continue
+        status = _as_text(raw.get("status")).lower()
+        if status not in {"open", "in_progress", "blocked"}:
+            continue
+        items.append(
+            {
+                "task_id": _as_text(raw.get("task_id")) or None,
+                "title": _normalize_line(_as_text(raw.get("title")))[:140] or None,
+                "status": status or None,
+                "blocked_reason": _normalize_line(_as_text(raw.get("blocked_reason")))[:140] or None,
+                "depends_on": [str(item).strip() for item in raw.get("depends_on", []) if str(item).strip()][:3],
+                "model_profile": _normalize_choice(raw.get("model_profile"), TASK_MODEL_PROFILES),
+            }
+        )
+    items.sort(
+        key=lambda item: (
+            0 if _as_text(item.get("task_id")) == selected_task_id else 1,
+            {"open": 0, "in_progress": 1, "blocked": 2}.get(_as_text(item.get("status")).lower(), 9),
+            _as_text(item.get("task_id")),
+        )
+    )
+    return items[:max_items]
+
+
+def _write_active_backlog_view(
+    *,
+    paths,
+    state: dict[str, Any],
+    prd_payload: dict[str, Any],
+    tasks_payload: dict[str, Any],
+    selected_task: dict[str, Any] | None,
+    phase_goal: str,
+) -> None:
+    selected_task_id = _as_text(selected_task.get("task_id")) if isinstance(selected_task, dict) else ""
+    selected_title = _as_text(selected_task.get("title")) if isinstance(selected_task, dict) else ""
+    payload = {
+        "next_task_id": _as_text(state.get("next_task_id")) or None,
+        "next_task_reason": _normalize_line(_as_text(state.get("next_task_reason")))[:180] or None,
+        "blockers_top2": [
+            _normalize_line(str(item).strip())[:180]
+            for item in state.get("blockers", [])
+            if str(item).strip()
+        ][:2],
+        "selected_task": {
+            "task_id": selected_task_id or None,
+            "model_profile": (
+                _normalize_choice(selected_task.get("model_profile"), TASK_MODEL_PROFILES)
+                if isinstance(selected_task, dict)
+                else None
+            ),
+            "fanout_risk": (
+                _normalize_choice(selected_task.get("fanout_risk"), TASK_FANOUT_RISKS)
+                if isinstance(selected_task, dict)
+                else None
+            ),
+            "acceptance_top3": (
+                _normalize_text_list(selected_task.get("acceptance"), item_chars=160, max_items=1)
+                if isinstance(selected_task, dict)
+                else []
+            ),
+            "validation_top3": (
+                _normalize_text_list(selected_task.get("validation"), item_chars=160, max_items=1)
+                if isinstance(selected_task, dict)
+                else []
+            ),
+        },
+        "active_backlog": _build_active_backlog_entries(
+            tasks_payload=tasks_payload,
+            selected_task_id=selected_task_id,
+        ),
+        "generated_at": utc_now(),
+    }
+    write_json(paths.active_backlog_json, payload)
 
 
 def _normalize_line(line: str) -> str:
@@ -1073,6 +1159,61 @@ def _task_depends_resolved(task: dict[str, Any], done_ids: set[str]) -> bool:
     return True
 
 
+def _dependency_block_reason(task: dict[str, Any], done_ids: set[str]) -> str:
+    deps = task.get("depends_on")
+    if not isinstance(deps, list):
+        return ""
+    unresolved = [str(dep).strip() for dep in deps if str(dep).strip() and str(dep).strip() not in done_ids]
+    if not unresolved:
+        return ""
+    if len(unresolved) > 3:
+        unresolved = [*unresolved[:3], "..."]
+    return f"waiting_on: {', '.join(unresolved)}"[:220]
+
+
+def _normalize_dependency_blockers(tasks_payload: dict[str, Any]) -> bool:
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return False
+    done_ids: set[str] = {
+        str(task.get("task_id", "")).strip()
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("status", "")).strip().lower() == "done"
+    }
+    changed = False
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        status = str(task.get("status", "")).strip().lower()
+        if status == "done":
+            if "blocked_reason" in task:
+                task.pop("blocked_reason", None)
+                changed = True
+            continue
+        dependency_reason = _dependency_block_reason(task, done_ids)
+        blocked_reason = _as_text(task.get("blocked_reason"))
+        dependency_blocked = blocked_reason.startswith("waiting_on:")
+        if dependency_reason:
+            if status in {"open", "in_progress"}:
+                task["status"] = "blocked"
+                task["blocked_reason"] = dependency_reason
+                task["updated_at"] = utc_now()
+                changed = True
+            elif status == "blocked" and (dependency_blocked or not blocked_reason) and blocked_reason != dependency_reason:
+                task["blocked_reason"] = dependency_reason
+                task["updated_at"] = utc_now()
+                changed = True
+        elif status == "blocked" and dependency_blocked:
+            task["status"] = "open"
+            task.pop("blocked_reason", None)
+            task["updated_at"] = utc_now()
+            changed = True
+        elif status in {"open", "in_progress"} and dependency_blocked:
+            task.pop("blocked_reason", None)
+            changed = True
+    return changed
+
+
 def _select_next_task(tasks_payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
     tasks = tasks_payload.get("tasks")
     if not isinstance(tasks, list):
@@ -1101,8 +1242,7 @@ def _select_next_task(tasks_payload: dict[str, Any]) -> tuple[dict[str, Any] | N
     if eligible:
         chosen = sorted(eligible, key=sort_key)[0]
         return chosen, "Deterministic selection: open + dependencies resolved + priority + oldest updated_at."
-    blocked = sorted(candidate_tasks, key=sort_key)[0]
-    return blocked, "Open tasks exist but dependencies are unresolved; selected oldest open task for visibility."
+    return None, "No dependency-resolved open tasks are currently available."
 
 
 def _find_task_index(tasks_payload: dict[str, Any], task_id: str) -> int:
@@ -1299,24 +1439,24 @@ def _build_phase_plan(*, phase: str, phase_goal: str, next_task_id: str | None, 
         return [
             phase_goal,
             "Use repo context sources plus runner delta to tighten the next work surface before coding.",
-            "Refresh state once via runctl --setup, write prepared marker at phase boundary, then exit.",
+            "Exit cleanly so the controller can refresh runner state and prepare the next cycle.",
         ]
     if phase == "verify":
         return [
             phase_goal,
             f"Stay on the current validation surface until blockers are cleared or narrowed: {task_text}",
-            "Refresh state once via runctl --setup, write prepared marker at phase boundary, then exit.",
+            "Exit cleanly so the controller can refresh runner state and prepare the next cycle.",
         ]
     if phase == "closeout":
         return [
             phase_goal,
             "Run final closeout gates and leave exactly one concrete blocker if done-state still fails.",
-            "Refresh state once via runctl --setup, write prepared marker at phase boundary, then exit.",
+            "Exit cleanly so the controller can refresh runner state and prepare the next cycle.",
         ]
     return [
         phase_goal,
         f"Stay on one coherent implementation surface while advancing: {task_text}",
-        "Refresh state once via runctl --setup, write prepared marker at phase boundary, then exit.",
+        "Exit cleanly so the controller can refresh runner state and prepare the next cycle.",
     ]
 
 
@@ -1325,6 +1465,7 @@ def _write_exec_context(
     paths,
     state: dict[str, Any],
     prd_payload: dict[str, Any],
+    tasks_payload: dict[str, Any],
     task: dict[str, Any] | None,
     project_root: Path,
     target_branch: str,
@@ -1334,7 +1475,7 @@ def _write_exec_context(
     context_delta: dict[str, Any],
 ) -> None:
     existing_exec_context = read_json(paths.exec_context_json) or {}
-    current_snapshot = _capture_progress_snapshot(state=state, project_root=project_root)
+    current_snapshot = _capture_progress_snapshot(state=state, project_root=project_root, tasks_payload=tasks_payload)
     preserved_cycle_baseline = (
         existing_exec_context.get("cycle_progress_baseline")
         if isinstance(existing_exec_context, dict)
@@ -1382,8 +1523,8 @@ def _write_exec_context(
     hard_rules = [
         "stay_within_phase_goal",
         "validate_as_you_go",
-        "refresh_runner_state_once",
-        "write_prepared_marker_at_phase_boundary",
+        "controller_refreshes_runner_state_after_prompt_exit",
+        "controller_writes_prepared_marker_after_prompt_exit",
         "exit_session_on_phase_handoff",
     ]
     if parity_fail_closed:
@@ -1472,7 +1613,46 @@ def _write_prepared_cycle_marker(
     return paths.cycle_prepared_file
 
 
-def _capture_progress_snapshot(*, state: dict[str, Any], project_root: Path) -> dict[str, Any]:
+def _active_backlog_digest(tasks_payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(tasks_payload, dict):
+        return None
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    active_entries: list[dict[str, Any]] = []
+    for raw in tasks:
+        if not isinstance(raw, dict):
+            continue
+        status = _as_text(raw.get("status")).lower()
+        if status not in {"open", "in_progress", "blocked"}:
+            continue
+        active_entries.append(
+            {
+                "task_id": _as_text(raw.get("task_id")) or None,
+                "title": _as_text(raw.get("title")) or None,
+                "status": status or None,
+                "blocked_reason": _as_text(raw.get("blocked_reason")) or None,
+                "depends_on": [str(item).strip() for item in raw.get("depends_on", []) if str(item).strip()],
+                "acceptance": [str(item).strip() for item in raw.get("acceptance", []) if str(item).strip()],
+                "validation": [str(item).strip() for item in raw.get("validation", []) if str(item).strip()],
+                "model_profile": _as_text(raw.get("model_profile")) or None,
+                "touch_paths": [str(item).strip() for item in raw.get("touch_paths", []) if str(item).strip()],
+                "coupling_notes": [str(item).strip() for item in raw.get("coupling_notes", []) if str(item).strip()],
+            }
+        )
+    if not active_entries:
+        return None
+    active_entries.sort(key=lambda item: (_as_text(item.get("task_id")), _as_text(item.get("title"))))
+    payload = json.dumps(active_entries, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+
+def _capture_progress_snapshot(
+    *,
+    state: dict[str, Any],
+    project_root: Path,
+    tasks_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     git_context = detect_git_context(project_root)
     return {
         "phase": coerce_runner_phase(state.get("current_phase"), default="discover"),
@@ -1482,6 +1662,7 @@ def _capture_progress_snapshot(*, state: dict[str, Any], project_root: Path) -> 
         "status": _as_text(state.get("status")) or None,
         "git_head": _as_text(git_context.get("git_head")) or None,
         "worktree_fingerprint": compute_worktree_fingerprint(project_root),
+        "active_backlog_digest": _active_backlog_digest(tasks_payload),
     }
 
 
@@ -1498,6 +1679,7 @@ def _progress_has_advanced(*, baseline: dict[str, Any] | None, current: dict[str
             _as_text(baseline.get("status")) != _as_text(current.get("status")),
             _as_text(baseline.get("git_head")) != _as_text(current.get("git_head")),
             _as_text(baseline.get("worktree_fingerprint")) != _as_text(current.get("worktree_fingerprint")),
+            _as_text(baseline.get("active_backlog_digest")) != _as_text(current.get("active_backlog_digest")),
         )
     )
 
@@ -1743,6 +1925,10 @@ def create_runner_state(
     if tasks_changed:
         created.append(str(paths.tasks_json.relative_to(paths.memory_dir)))
 
+    if _normalize_dependency_blockers(tasks_payload):
+        tasks_changed = True
+        write_json(paths.tasks_json, tasks_payload)
+
     closeout_gate_result: tuple[bool | None, str] | None = None
     open_task_candidates = _open_task_entries(tasks_payload)
     if len(open_task_candidates) == 1 and _looks_like_done_closeout_task(open_task_candidates[0]):
@@ -1803,6 +1989,9 @@ def create_runner_state(
     if branch_error:
         blockers.append(f"Branch enforcement failed: {branch_error}")
     blockers = [str(item).strip() for item in blockers if str(item).strip()][-8:]
+    if not isinstance(selected_task, dict) and open_tasks_count > 0:
+        blockers.append(selection_reason[:220])
+        blockers = blockers[-8:]
 
     state_revision = int(state.get("state_revision", 0)) + 1
     status_value = "ready"
@@ -1849,7 +2038,7 @@ def create_runner_state(
                     done_gate_status_value = "pending"
                     next_task_text = "Resolve final done-closeout validation prerequisites."
                     selection_reason = "No open tasks remain, but done-closeout validation could not run yet."
-    elif branch_error:
+    elif branch_error or (open_tasks_count > 0 and not isinstance(selected_task, dict)):
         status_value = "blocked"
         paths.done_lock.unlink(missing_ok=True)
     else:
@@ -1989,6 +2178,14 @@ def create_runner_state(
         phase_goal=phase_goal,
         project_root=project_root,
     )
+    _write_active_backlog_view(
+        paths=paths,
+        state=state,
+        prd_payload=prd_payload,
+        tasks_payload=tasks_payload,
+        selected_task=selected_task if isinstance(selected_task, dict) else None,
+        phase_goal=phase_goal,
+    )
     context_sources = _collect_context_sources(project_root)
     phase_context_digest = _digest_text(
         "|".join(str(source.get("digest", "")) for source in context_sources if str(source.get("digest", "")).strip())
@@ -2001,6 +2198,7 @@ def create_runner_state(
         paths=paths,
         state=state,
         prd_payload=prd_payload,
+        tasks_payload=tasks_payload,
         task=selected_task if isinstance(selected_task, dict) else None,
         project_root=project_root,
         target_branch=target_branch,
@@ -2223,6 +2421,31 @@ def _inspect_runner_start_state(
     if paths.stop_lock.exists():
         stop_meta = _read_lock_metadata(paths.stop_lock)
         source = _as_text(stop_meta.get("source"))
+        if source == "runner_update_failure" and allow_refresh_repair:
+            create_runner_state(
+                dev=dev,
+                project=project,
+                runner_id=runner_id,
+                approve_enable=None,
+                project_root=resolved_root,
+            )
+            repaired = _inspect_runner_start_state(
+                dev=dev,
+                project=project,
+                runner_id=runner_id,
+                project_root=resolved_root,
+                allow_refresh_repair=False,
+            )
+            if repaired.get("ok"):
+                return repaired
+            stop_lines = [f"requested_at={_as_text(stop_meta.get('requested_at')) or utc_now()}"]
+            for key in ("source", "reason", "phase", "session"):
+                value = _as_text(stop_meta.get(key))
+                if value:
+                    stop_lines.append(f"{key}={value}")
+            paths.stop_lock.parent.mkdir(parents=True, exist_ok=True)
+            paths.stop_lock.write_text("\n".join(stop_lines) + "\n", encoding="utf-8")
+            return repaired
         if source == "runner_no_progress":
             error_text = (
                 "Runner is paused because the last cycle made no durable progress. "
@@ -2945,7 +3168,12 @@ def run(argv: list[str]) -> int:
             baseline = exec_context.get("cycle_progress_baseline")
             if not isinstance(baseline, dict):
                 baseline = exec_context.get("progress_baseline")
-        current_snapshot = _capture_progress_snapshot(state=state, project_root=project_root)
+        tasks_payload = read_json(paths.tasks_json) or {}
+        current_snapshot = _capture_progress_snapshot(
+            state=state,
+            project_root=project_root,
+            tasks_payload=tasks_payload if isinstance(tasks_payload, dict) else None,
+        )
         if not _progress_has_advanced(baseline=baseline if isinstance(baseline, dict) else None, current=current_snapshot):
             _err("ERROR: refusing to prepare cycle marker because no durable progress was detected since RUNNER_EXEC_CONTEXT.json")
             return 1
