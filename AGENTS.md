@@ -79,3 +79,5 @@ Rules:
 - Prefer small, cohesive feature components over god components.
 - Keep pure render pieces separate from stateful orchestration when that split improves clarity.
 - Preserve stable naming, file ordering, and grep-friendly exports/test IDs.
+- Before making a UI/UX change, trace the component owner chain far enough to understand where props, composition, and shared styles originate.
+- For CSS, layout, and visual system changes, assess likely cascade and reuse impact before editing so fixes stay at the right layer and do not create unintended downstream changes.
