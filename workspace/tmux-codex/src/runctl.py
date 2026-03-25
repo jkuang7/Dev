@@ -15,16 +15,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .runner_graph import (
+    build_runner_graph_artifacts,
+    load_graph_config_for_project,
+    summarize_task_graph_slice,
+)
 from .runner_state import (
+    DONE_NEXT_TASK_TEXT,
     DEFAULT_PHASE_BUDGET_MINUTES,
     append_ndjson,
     build_runner_state_paths_for_root,
     coerce_runner_phase,
     compute_worktree_fingerprint,
+    count_open_seams,
     count_open_tasks,
     detect_git_context,
     ensure_memory_dir,
     load_or_init_state,
+    load_state_snapshot,
     managed_runner_files,
     read_json,
     worktrees_home,
@@ -39,7 +47,7 @@ TASK_MODEL_PROFILES = {"mini", "high"}
 TASK_FANOUT_RISKS = {"low", "medium", "high"}
 TASK_DEPRECATION_PHASES = {"seam", "shim", "consumer_migration", "convergence", "removal"}
 SETUP_EVENT_COALESCE_SECONDS = 90
-RUNNER_PROMPT_NAMES = ("run_setup", "run_execute", "run_update", "add")
+RUNNER_PROMPT_NAMES = ("run_setup", "run_execute", "run_govern", "add")
 
 
 def _default_dev() -> str:
@@ -618,6 +626,7 @@ def _collect_context_sources(project_root: Path) -> list[dict[str, Any]]:
     memory_dir = project_root / ".memory"
     _add(memory_dir / "PRD.md", kind="repo_prd")
     _add(memory_dir / "lessons.md", kind="repo_lessons")
+    _add(memory_dir / "runner" / "RUNNER_PARITY.json", kind="runner_parity")
     if not (memory_dir / "PRD.md").exists():
         _add(memory_dir / "REFRACTOR_STATUS.md", kind="legacy_repo_prd")
 
@@ -655,7 +664,7 @@ def _sync_runner_handoff_file(
     project_root: Path,
 ) -> None:
     objective_title = _normalize_objective_title(_as_text(prd_payload.get("title"))) or _as_text(state.get("current_goal"))
-    next_task_id = _as_text(state.get("next_task_id"))
+    next_task_id = _as_text(state.get("active_seam_id")) or _as_text(state.get("next_task_id"))
     next_task = _as_text(state.get("next_task"))
     next_task_reason = _as_text(state.get("next_task_reason"))
     current_phase = coerce_runner_phase(state.get("current_phase"), default="discover")
@@ -790,10 +799,18 @@ def _write_active_backlog_view(
     tasks_payload: dict[str, Any],
     selected_task: dict[str, Any] | None,
     phase_goal: str,
+    graph_summary: dict[str, Any] | None = None,
+    parity_scope: dict[str, Any] | None = None,
 ) -> None:
     selected_task_id = _as_text(selected_task.get("task_id")) if isinstance(selected_task, dict) else ""
     selected_title = _as_text(selected_task.get("title")) if isinstance(selected_task, dict) else ""
+    graph_summary = graph_summary if isinstance(graph_summary, dict) else {}
+    parity_scope = parity_scope if isinstance(parity_scope, dict) else {}
     payload = {
+        "objective_id": _as_text(state.get("objective_id")) or None,
+        "active_seam_id": _as_text(state.get("active_seam_id")) or selected_task_id or None,
+        "next_seam_id": _as_text(state.get("next_seam_id") or state.get("next_task_id")) or None,
+        "next_seam_reason": _normalize_line(_as_text(state.get("next_seam_reason") or state.get("next_task_reason")))[:180] or None,
         "next_task_id": _as_text(state.get("next_task_id")) or None,
         "next_task_reason": _normalize_line(_as_text(state.get("next_task_reason")))[:180] or None,
         "blockers_top2": [
@@ -823,6 +840,26 @@ def _write_active_backlog_view(
                 if isinstance(selected_task, dict)
                 else []
             ),
+            "graph_cluster_label": _as_text(graph_summary.get("graph_cluster_label")) or None,
+            "graph_slice_reason": _as_text(graph_summary.get("graph_slice_reason")) or None,
+            "graph_adjacent_families_top3": [
+                str(item).strip()
+                for item in graph_summary.get("graph_adjacent_families_top3", [])
+                if str(item).strip()
+            ][:3],
+            "graph_boundary_warnings_top2": [
+                str(item).strip()
+                for item in graph_summary.get("graph_boundary_warnings_top3", [])
+                if str(item).strip()
+            ][:2],
+            "parity_enabled": bool(parity_scope.get("parity_enabled", False)),
+            "parity_baseline_ref": _as_text(parity_scope.get("parity_baseline_ref")) or None,
+            "parity_surface_ids_top3": [
+                str(item).strip()
+                for item in parity_scope.get("parity_surface_ids", [])
+                if str(item).strip()
+            ][:3],
+            "parity_audit_mode": _as_text(parity_scope.get("parity_audit_mode")) or None,
         },
         "active_backlog": _build_active_backlog_entries(
             tasks_payload=tasks_payload,
@@ -883,6 +920,274 @@ def _normalize_text_list(raw: Any, *, item_chars: int = 220, max_items: int = 16
         if len(items) >= max_items:
             break
     return items
+
+
+def _normalize_parity_surface_ids(raw: Any, *, max_items: int = 8) -> list[str]:
+    return _normalize_text_list(raw, item_chars=80, max_items=max_items)
+
+
+def _normalize_parity_harness_commands(raw: Any, *, max_items: int = 4) -> list[str]:
+    return _normalize_text_list(raw, item_chars=220, max_items=max_items)
+
+
+def _coerce_int(raw: Any, *, default: int) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_runner_parity_policy(raw: Any) -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    audit_mode = _as_text(source.get("audit_mode")).lower()
+    if audit_mode not in {"targeted", "diff_only", "skip"}:
+        audit_mode = "targeted"
+    return {
+        "fail_closed": bool(source.get("fail_closed", True)),
+        "audit_mode": audit_mode,
+        "default_max_surface_checks_mini": max(
+            0,
+            min(4, _coerce_int(source.get("default_max_surface_checks_mini", 1) or 1, default=1)),
+        ),
+        "default_max_surface_checks_high": max(
+            0,
+            min(6, _coerce_int(source.get("default_max_surface_checks_high", 2) or 2, default=2)),
+        ),
+        "diff_first": bool(source.get("diff_first", True)),
+        "mcp_when": _normalize_text_list(source.get("mcp_when"), item_chars=140, max_items=6),
+    }
+
+
+def _normalize_runner_parity_surface(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    surface_id = _normalize_line(_as_text(raw.get("surface_id")))[:80]
+    if not surface_id:
+        return None
+    runtime = _as_text(raw.get("runtime")).lower()
+    if runtime not in {"desktop", "web", "shared"}:
+        runtime = "shared"
+    kind = _normalize_line(_as_text(raw.get("kind")))[:80] or "ui_surface"
+    preferred_mcp = _normalize_text_list(raw.get("preferred_mcp"), item_chars=60, max_items=3)
+    normalized = {
+        "surface_id": surface_id,
+        "runtime": runtime,
+        "kind": kind,
+        "owner_paths": _normalize_text_list(raw.get("owner_paths"), item_chars=220, max_items=12),
+        "watch_paths": _normalize_text_list(raw.get("watch_paths"), item_chars=220, max_items=12),
+        "preferred_mcp": preferred_mcp,
+        "baseline_expectation": _normalize_line(_as_text(raw.get("baseline_expectation")))[:220] or None,
+        "harness_commands": _normalize_parity_harness_commands(raw.get("harness_commands"), max_items=4),
+    }
+    return normalized
+
+
+def _normalize_runner_parity_payload(
+    raw: Any,
+    *,
+    objective_id: str,
+    baseline_ref: str | None = None,
+    baseline_git_head: str | None = None,
+) -> dict[str, Any]:
+    payload = raw if isinstance(raw, dict) else {}
+    normalized = {
+        "objective_id": _as_text(payload.get("objective_id")) or objective_id,
+        "baseline_ref": _as_text(payload.get("baseline_ref")) or baseline_ref or None,
+        "baseline_label": _normalize_line(_as_text(payload.get("baseline_label")))[:140] or None,
+        "baseline_git_head": _as_text(payload.get("baseline_git_head")) or baseline_git_head or None,
+        "policy": _normalize_runner_parity_policy(payload.get("policy")),
+        "surfaces": [],
+        "updated_at": _as_text(payload.get("updated_at")) or utc_now(),
+    }
+    seen_surface_ids: set[str] = set()
+    for item in payload.get("surfaces", []) if isinstance(payload.get("surfaces"), list) else []:
+        surface = _normalize_runner_parity_surface(item)
+        if surface is None:
+            continue
+        surface_id = _as_text(surface.get("surface_id"))
+        if surface_id in seen_surface_ids:
+            continue
+        seen_surface_ids.add(surface_id)
+        normalized["surfaces"].append(surface)
+    return normalized
+
+
+def _task_has_parity_metadata(task: dict[str, Any]) -> bool:
+    return any(
+        (
+            _as_text(task.get("parity_baseline_ref")),
+            bool(_normalize_parity_surface_ids(task.get("parity_surface_ids"))),
+            bool(_normalize_parity_harness_commands(task.get("parity_harness_commands"))),
+            _as_text(task.get("parity_notes")),
+        )
+    )
+
+
+def _build_default_runner_parity_payload(
+    *,
+    prd_payload: dict[str, Any],
+    tasks_payload: dict[str, Any],
+    project_root: Path,
+) -> dict[str, Any]:
+    git_context = detect_git_context(project_root)
+    objective_id = _as_text(prd_payload.get("objective_id")) or _new_objective_id()
+    baseline_ref: str | None = None
+    surfaces: list[dict[str, Any]] = []
+    seen_surface_ids: set[str] = set()
+    tasks = tasks_payload.get("tasks")
+    if isinstance(tasks, list):
+        for raw in tasks:
+            if not isinstance(raw, dict):
+                continue
+            if baseline_ref is None:
+                candidate_baseline = _normalize_line(_as_text(raw.get("parity_baseline_ref")))[:80]
+                if candidate_baseline:
+                    baseline_ref = candidate_baseline
+            for surface_id in _normalize_parity_surface_ids(raw.get("parity_surface_ids")):
+                if surface_id in seen_surface_ids:
+                    continue
+                seen_surface_ids.add(surface_id)
+                surfaces.append(
+                    {
+                        "surface_id": surface_id,
+                        "runtime": "shared",
+                        "kind": "ui_surface",
+                        "owner_paths": [],
+                        "watch_paths": _normalize_text_list(raw.get("touch_paths"), item_chars=220, max_items=8),
+                        "preferred_mcp": [],
+                        "baseline_expectation": None,
+                        "harness_commands": _normalize_parity_harness_commands(raw.get("parity_harness_commands")),
+                    }
+                )
+    return {
+        "objective_id": objective_id,
+        "baseline_ref": baseline_ref,
+        "baseline_label": None,
+        "baseline_git_head": _as_text(git_context.get("git_head")) or None,
+        "policy": _normalize_runner_parity_policy({}),
+        "surfaces": surfaces,
+        "updated_at": utc_now(),
+    }
+
+
+def _ensure_runner_parity_payload(
+    *,
+    paths,
+    prd_payload: dict[str, Any],
+    tasks_payload: dict[str, Any],
+    project_root: Path,
+) -> tuple[dict[str, Any], bool]:
+    existing = read_json(paths.runner_parity_json)
+    baseline_head = _as_text(detect_git_context(project_root).get("git_head")) or None
+    if existing is None:
+        normalized = _build_default_runner_parity_payload(
+            prd_payload=prd_payload,
+            tasks_payload=tasks_payload,
+            project_root=project_root,
+        )
+    else:
+        normalized = _normalize_runner_parity_payload(
+            existing,
+            objective_id=_as_text(prd_payload.get("objective_id")) or _new_objective_id(),
+            baseline_git_head=baseline_head,
+        )
+    known_surface_ids = {
+        _as_text(item.get("surface_id"))
+        for item in normalized.get("surfaces", [])
+        if isinstance(item, dict) and _as_text(item.get("surface_id"))
+    }
+    tasks = tasks_payload.get("tasks")
+    if isinstance(tasks, list):
+        for raw in tasks:
+            if not isinstance(raw, dict):
+                continue
+            if not _task_has_parity_metadata(raw):
+                continue
+            if not _as_text(normalized.get("baseline_ref")):
+                candidate_baseline = _normalize_line(_as_text(raw.get("parity_baseline_ref")))[:80]
+                if candidate_baseline:
+                    normalized["baseline_ref"] = candidate_baseline
+            for surface_id in _normalize_parity_surface_ids(raw.get("parity_surface_ids")):
+                if surface_id in known_surface_ids:
+                    continue
+                known_surface_ids.add(surface_id)
+                normalized["surfaces"].append(
+                    {
+                        "surface_id": surface_id,
+                        "runtime": "shared",
+                        "kind": "ui_surface",
+                        "owner_paths": [],
+                        "watch_paths": _normalize_text_list(raw.get("touch_paths"), item_chars=220, max_items=8),
+                        "preferred_mcp": [],
+                        "baseline_expectation": None,
+                        "harness_commands": _normalize_parity_harness_commands(raw.get("parity_harness_commands")),
+                    }
+                )
+    changed = existing != normalized
+    if changed:
+        write_json(paths.runner_parity_json, normalized)
+    return normalized, changed
+
+
+def _resolve_task_parity_scope(
+    *,
+    task: dict[str, Any] | None,
+    parity_payload: dict[str, Any] | None,
+    title: str,
+    acceptance: list[str],
+    validation: list[str],
+) -> dict[str, Any]:
+    policy = _normalize_runner_parity_policy((parity_payload or {}).get("policy"))
+    task_dict = task if isinstance(task, dict) else {}
+    parity_surface_ids = _normalize_parity_surface_ids(task_dict.get("parity_surface_ids"))
+    surfaces_by_id = {
+        _as_text(item.get("surface_id")): item
+        for item in ((parity_payload or {}).get("surfaces") if isinstance((parity_payload or {}).get("surfaces"), list) else [])
+        if isinstance(item, dict) and _as_text(item.get("surface_id"))
+    }
+    parity_surfaces = [surfaces_by_id[surface_id] for surface_id in parity_surface_ids if surface_id in surfaces_by_id]
+    task_audit_mode = _as_text(task_dict.get("parity_audit_mode")).lower()
+    if task_audit_mode not in {"targeted", "diff_only", "skip"}:
+        task_audit_mode = _as_text(policy.get("audit_mode")).lower() or "targeted"
+    parity_baseline_ref = (
+        _as_text(task_dict.get("parity_baseline_ref"))
+        or _as_text((parity_payload or {}).get("baseline_ref"))
+        or None
+    )
+    parity_harness_commands = _normalize_parity_harness_commands(task_dict.get("parity_harness_commands"))
+    if not parity_harness_commands:
+        for surface in parity_surfaces:
+            parity_harness_commands.extend(
+                command
+                for command in _normalize_parity_harness_commands(surface.get("harness_commands"))
+                if command not in parity_harness_commands
+            )
+            if len(parity_harness_commands) >= 4:
+                break
+    parity_fail_closed = bool(policy.get("fail_closed", True)) and (
+        bool(parity_surface_ids)
+        or bool(parity_baseline_ref)
+        or _looks_like_strict_parity_task(title=title, acceptance=acceptance, validation=validation)
+    )
+    trigger_reason_parts: list[str] = []
+    if parity_surface_ids:
+        trigger_reason_parts.append("task declares parity surfaces")
+    if parity_baseline_ref:
+        trigger_reason_parts.append(f"baseline={parity_baseline_ref}")
+    if not trigger_reason_parts and parity_fail_closed:
+        trigger_reason_parts.append("task acceptance/validation reads like parity work")
+    return {
+        "parity_enabled": parity_fail_closed,
+        "parity_baseline_ref": parity_baseline_ref,
+        "parity_surface_ids": parity_surface_ids,
+        "parity_surfaces": parity_surfaces,
+        "parity_audit_mode": task_audit_mode,
+        "parity_harness_commands": parity_harness_commands[:4],
+        "parity_fail_closed": parity_fail_closed,
+        "parity_trigger_reason": "; ".join(trigger_reason_parts)[:220] or None,
+        "parity_notes": _normalize_line(_as_text(task_dict.get("parity_notes")))[:220] or None,
+        "parity_policy": policy,
+    }
 
 
 def _task_marked_superseded(task: dict[str, Any]) -> bool:
@@ -977,6 +1282,21 @@ def _normalize_task_entry(
     coupling_notes = _normalize_text_list(raw.get("coupling_notes"), item_chars=220, max_items=8)
     if coupling_notes:
         normalized["coupling_notes"] = coupling_notes
+    parity_baseline_ref = _normalize_line(_as_text(raw.get("parity_baseline_ref")))[:80]
+    if parity_baseline_ref:
+        normalized["parity_baseline_ref"] = parity_baseline_ref
+    parity_surface_ids = _normalize_parity_surface_ids(raw.get("parity_surface_ids"))
+    if parity_surface_ids:
+        normalized["parity_surface_ids"] = parity_surface_ids
+    parity_audit_mode = _as_text(raw.get("parity_audit_mode")).lower()
+    if parity_audit_mode in {"targeted", "diff_only", "skip"}:
+        normalized["parity_audit_mode"] = parity_audit_mode
+    parity_harness_commands = _normalize_parity_harness_commands(raw.get("parity_harness_commands"))
+    if parity_harness_commands:
+        normalized["parity_harness_commands"] = parity_harness_commands
+    parity_notes = _normalize_line(_as_text(raw.get("parity_notes")))[:220]
+    if parity_notes:
+        normalized["parity_notes"] = parity_notes
     return normalized
 
 
@@ -1046,13 +1366,373 @@ def _default_prd(state: dict[str, Any], *, project: str, project_root: Path) -> 
     return {
         "objective_id": objective_id,
         "title": title,
-        "scope_in": ["Complete canonical runner tasks for current objective"],
+        "scope_in": [f"Seed concrete TT-001.. tasks from the active objective: {title}"],
         "scope_out": ["Unscoped feature work not represented in TASKS.json"],
-        "success_criteria": ["All tasks marked done and run_gates passes"],
+        "success_criteria": [f"TT-001 names the first concrete slice for {title}"],
         "constraints": ["Single runner_id=main", "Worktree/root scope must remain fixed"],
         "project_root": str(project_root.resolve()),
         "updated_at": utc_now(),
     }
+
+
+def _default_objective_payload(
+    state: dict[str, Any],
+    *,
+    project: str,
+    project_root: Path,
+) -> dict[str, Any]:
+    title = _normalize_objective_title(_as_text(state.get("current_goal"))) or f"{project} runner objective"
+    objective_id = _as_text(state.get("objective_id")) or _new_objective_id()
+    return {
+        "objective_id": objective_id,
+        "title": title,
+        "goal_summary": title,
+        "success_criteria": [f"Complete the prepared seams for {title} and pass final closeout gates."],
+        "constraints": ["Single runner_id=main", "Worktree/root scope must remain fixed"],
+        "non_goals": ["Unscoped feature work outside the prepared seam backlog"],
+        "completion_gate": "Final done-closeout `run_gates` passes after required seams complete.",
+        "project_root": str(project_root.resolve()),
+        "updated_at": utc_now(),
+    }
+
+
+def _task_to_seam(
+    task: dict[str, Any],
+    *,
+    objective_id: str,
+    graph_cluster_label: str | None = None,
+) -> dict[str, Any]:
+    task_id = _as_text(task.get("task_id"))
+    title = _as_text(task.get("title"))
+    seam: dict[str, Any] = {
+        "seam_id": task_id or None,
+        "title": title or None,
+        "status": _as_text(task.get("status")).lower() or "open",
+        "priority": _as_text(task.get("priority")) or "p1",
+        "objective_id": objective_id,
+        "project_root": _as_text(task.get("project_root")) or None,
+        "target_branch": _as_text(task.get("target_branch")) or None,
+        "owner_problem": title or None,
+        "why_now": _as_text(task.get("profile_reason")) or _as_text(task.get("blocked_reason")) or None,
+        "write_set": [str(item).strip() for item in task.get("touch_paths", []) if str(item).strip()],
+        "acceptance": [str(item).strip() for item in task.get("acceptance", []) if str(item).strip()],
+        "checks": [str(item).strip() for item in task.get("validation", []) if str(item).strip()],
+        "depends_on": [str(item).strip() for item in task.get("depends_on", []) if str(item).strip()],
+        "model_profile": _normalize_choice(task.get("model_profile"), TASK_MODEL_PROFILES) or "high",
+        "fanout_risk": _normalize_choice(task.get("fanout_risk"), TASK_FANOUT_RISKS) or "high",
+        "touch_paths": [str(item).strip() for item in task.get("touch_paths", []) if str(item).strip()],
+        "validation_commands": [str(item).strip() for item in task.get("validation_commands", []) if str(item).strip()],
+        "spillover_paths": [str(item).strip() for item in task.get("spillover_paths", []) if str(item).strip()],
+        "coupling_notes": [str(item).strip() for item in task.get("coupling_notes", []) if str(item).strip()],
+        "deprecation_phase": _as_text(task.get("deprecation_phase")) or None,
+        "parity_baseline_ref": _as_text(task.get("parity_baseline_ref")) or None,
+        "parity_surface_ids": [str(item).strip() for item in task.get("parity_surface_ids", []) if str(item).strip()],
+        "parity_audit_mode": _as_text(task.get("parity_audit_mode")) or None,
+        "parity_harness_commands": [
+            str(item).strip() for item in task.get("parity_harness_commands", []) if str(item).strip()
+        ],
+        "parity_notes": _as_text(task.get("parity_notes")) or None,
+        "graph_cluster_label": graph_cluster_label or None,
+        "updated_at": _as_text(task.get("updated_at")) or utc_now(),
+    }
+    if "blocked_reason" in task and _as_text(task.get("blocked_reason")):
+        seam["blocked_reason"] = _as_text(task.get("blocked_reason"))
+    return seam
+
+
+def _seam_to_task(
+    seam: dict[str, Any],
+    *,
+    index: int,
+    project_root: Path,
+    target_branch: str,
+    objective_id: str,
+) -> dict[str, Any]:
+    return _normalize_task_entry(
+        {
+            "task_id": _as_text(seam.get("seam_id")) or f"SM-{index + 1:03d}",
+            "title": _as_text(seam.get("title")) or _as_text(seam.get("owner_problem")) or f"Seam {index + 1}",
+            "status": _as_text(seam.get("status")) or "open",
+            "priority": _as_text(seam.get("priority")) or "p1",
+            "depends_on": seam.get("depends_on") or [],
+            "project_root": _as_text(seam.get("project_root")) or str(project_root.resolve()),
+            "target_branch": _as_text(seam.get("target_branch")) or target_branch,
+            "acceptance": seam.get("acceptance") or [],
+            "validation": seam.get("checks") or seam.get("validation_commands") or [],
+            "updated_at": _as_text(seam.get("updated_at")) or utc_now(),
+            "objective_id": _as_text(seam.get("objective_id")) or objective_id,
+            "model_profile": _as_text(seam.get("model_profile")) or "high",
+            "fanout_risk": _as_text(seam.get("fanout_risk")) or "high",
+            "profile_reason": _as_text(seam.get("why_now")) or "",
+            "deprecation_phase": _as_text(seam.get("deprecation_phase")) or "",
+            "touch_paths": seam.get("touch_paths") or seam.get("write_set") or [],
+            "validation_commands": seam.get("validation_commands") or seam.get("checks") or [],
+            "spillover_paths": seam.get("spillover_paths") or [],
+            "coupling_notes": seam.get("coupling_notes") or [],
+            "parity_baseline_ref": _as_text(seam.get("parity_baseline_ref")) or "",
+            "parity_surface_ids": seam.get("parity_surface_ids") or [],
+            "parity_audit_mode": _as_text(seam.get("parity_audit_mode")) or "",
+            "parity_harness_commands": seam.get("parity_harness_commands") or [],
+            "parity_notes": _as_text(seam.get("parity_notes")) or "",
+            "blocked_reason": _as_text(seam.get("blocked_reason")) or "",
+        },
+        index=index,
+        project_root=project_root,
+        target_branch=target_branch,
+        objective_id=objective_id,
+    )
+
+
+def _build_seams_from_tasks(
+    *,
+    tasks_payload: dict[str, Any],
+    objective_id: str,
+) -> dict[str, Any]:
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        tasks = []
+    seams = [_task_to_seam(task, objective_id=objective_id) for task in tasks if isinstance(task, dict)]
+    return {
+        "objective_id": objective_id,
+        "active_seam_id": _as_text(next((task.get("task_id") for task in tasks if isinstance(task, dict) and _as_text(task.get("status")).lower() in {"open", "in_progress"}), "")) or None,
+        "seams": seams,
+        "updated_at": utc_now(),
+    }
+
+
+def _seams_payload_from_tasks_file(
+    *,
+    paths,
+    objective_id: str,
+) -> dict[str, Any] | None:
+    tasks_payload = read_json(paths.tasks_json)
+    if not isinstance(tasks_payload, dict):
+        return None
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    return _build_seams_from_tasks(tasks_payload=tasks_payload, objective_id=objective_id)
+
+
+def _build_tasks_from_seams(
+    *,
+    seams_payload: dict[str, Any],
+    project_root: Path,
+    target_branch: str,
+    objective_id: str,
+) -> dict[str, Any]:
+    seams = seams_payload.get("seams")
+    if not isinstance(seams, list):
+        seams = []
+    tasks = [
+        _seam_to_task(
+            seam,
+            index=index,
+            project_root=project_root,
+            target_branch=target_branch,
+            objective_id=objective_id,
+        )
+        for index, seam in enumerate(seams)
+        if isinstance(seam, dict)
+    ]
+    return {
+        "objective_id": objective_id,
+        "tasks": tasks,
+    }
+
+
+def _open_seam_entries(seams_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    seams = seams_payload.get("seams")
+    if not isinstance(seams, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for raw in seams:
+        if not isinstance(raw, dict):
+            continue
+        status = _as_text(raw.get("status")).lower()
+        if status in {"open", "in_progress", "blocked"}:
+            items.append(raw)
+    return items
+
+
+def _has_completed_done_closeout_seam(seams_payload: dict[str, Any]) -> bool:
+    seams = seams_payload.get("seams")
+    if not isinstance(seams, list):
+        return False
+    for raw in seams:
+        if not isinstance(raw, dict):
+            continue
+        if _as_text(raw.get("status")).lower() == "done" and _looks_like_done_closeout_task(
+            {
+                "title": _as_text(raw.get("title")),
+                "acceptance": raw.get("acceptance") or [],
+                "validation": raw.get("checks") or [],
+            }
+        ):
+            return True
+    return False
+
+
+def _next_closeout_seam_id(seams_payload: dict[str, Any]) -> str:
+    seams = seams_payload.get("seams")
+    if not isinstance(seams, list):
+        return "SM-001"
+    max_index = 0
+    for raw in seams:
+        if not isinstance(raw, dict):
+            continue
+        seam_id = _as_text(raw.get("seam_id"))
+        match = re.fullmatch(r"SM-(\d+)", seam_id)
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+    return f"SM-{max_index + 1:03d}"
+
+
+def _ensure_done_closeout_seam(
+    *,
+    seams_payload: dict[str, Any],
+    project_root: Path,
+    target_branch: str,
+    objective_id: str,
+) -> tuple[str | None, bool]:
+    seams = seams_payload.get("seams")
+    if not isinstance(seams, list):
+        return None, False
+    for raw in seams:
+        if not isinstance(raw, dict):
+            continue
+        if not _looks_like_done_closeout_task(
+            {
+                "title": _as_text(raw.get("title")),
+                "acceptance": raw.get("acceptance") or [],
+                "validation": raw.get("checks") or [],
+            }
+        ):
+            continue
+        changed = False
+        if _as_text(raw.get("status")).lower() != "open":
+            raw["status"] = "open"
+            raw["updated_at"] = utc_now()
+            changed = True
+        if "blocked_reason" in raw:
+            raw.pop("blocked_reason", None)
+            changed = True
+        seams_payload["active_seam_id"] = _as_text(raw.get("seam_id")) or seams_payload.get("active_seam_id")
+        return _as_text(raw.get("seam_id")) or None, changed
+
+    seam_id = _next_closeout_seam_id(seams_payload)
+    seams.append(
+        {
+            "seam_id": seam_id,
+            "title": "Run final done-closeout `run_gates` check before closing the objective.",
+            "status": "open",
+            "priority": "p1",
+            "depends_on": [],
+            "project_root": str(project_root.resolve()),
+            "target_branch": target_branch,
+            "objective_id": objective_id,
+            "model_profile": "mini",
+            "owner_problem": "Objective closeout has not yet been verified through final repository gates.",
+            "why_now": "All required seams are complete or no actionable seams remain, so explicit closeout verification is now the only truthful frontier.",
+            "acceptance": [
+                "Complete: No open runner seams remain after the active backlog has been safely cleared.",
+                "Complete: Final done-closeout `run_gates` validation passes before the runner writes `RUNNER_DONE.lock`.",
+            ],
+            "checks": [
+                "Run final done-state gate check (`run_gates`).",
+            ],
+            "write_set": [],
+            "touch_paths": [],
+            "validation_commands": ["run_gates"],
+            "updated_at": utc_now(),
+        }
+    )
+    seams_payload["active_seam_id"] = seam_id
+    return seam_id, True
+
+
+def _ensure_objective_payload(
+    *,
+    paths,
+    state: dict[str, Any],
+    project: str,
+    project_root: Path,
+    prd_payload: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    payload = read_json(paths.objective_json)
+    changed = False
+    if not isinstance(payload, dict):
+        payload = _default_objective_payload(state, project=project, project_root=project_root)
+        changed = True
+    title = _normalize_objective_title(_as_text(prd_payload.get("title"))) or _normalize_objective_title(_as_text(payload.get("title")))
+    if title and title != _as_text(payload.get("title")):
+        payload["title"] = title
+        payload["goal_summary"] = title
+        changed = True
+    objective_id = _as_text(prd_payload.get("objective_id")) or _as_text(payload.get("objective_id")) or _new_objective_id()
+    if objective_id != _as_text(payload.get("objective_id")):
+        payload["objective_id"] = objective_id
+        changed = True
+    payload.setdefault("goal_summary", _as_text(payload.get("title")) or title)
+    payload["project_root"] = str(project_root.resolve())
+    payload["success_criteria"] = [
+        str(item).strip()
+        for item in (prd_payload.get("success_criteria") or payload.get("success_criteria") or [])
+        if str(item).strip()
+    ] or [f"Complete the prepared seams for {title or project} and pass final closeout gates."]
+    payload["constraints"] = [
+        str(item).strip()
+        for item in (prd_payload.get("constraints") or payload.get("constraints") or [])
+        if str(item).strip()
+    ] or ["Single runner_id=main", "Worktree/root scope must remain fixed"]
+    payload.setdefault("non_goals", ["Unscoped feature work outside the prepared seam backlog"])
+    payload.setdefault("completion_gate", "Final done-closeout `run_gates` passes after required seams complete.")
+    payload["updated_at"] = utc_now()
+    write_json(paths.objective_json, payload)
+    return payload, changed
+
+
+def _ensure_seams_payload(
+    *,
+    paths,
+    objective_payload: dict[str, Any],
+    tasks_payload: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    objective_id = _as_text(objective_payload.get("objective_id")) or _new_objective_id()
+    derived = _build_seams_from_tasks(tasks_payload=tasks_payload, objective_id=objective_id)
+    existing = read_json(paths.seams_json)
+    existing_digest = json.dumps(existing, sort_keys=True) if isinstance(existing, dict) else ""
+    derived_digest = json.dumps(derived, sort_keys=True)
+    changed = existing_digest != derived_digest
+    if changed or not isinstance(existing, dict):
+        write_json(paths.seams_json, derived)
+    return (derived if changed or not isinstance(existing, dict) else existing), changed
+
+
+def _ensure_gaps_payload(
+    *,
+    paths,
+    objective_payload: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    payload = read_json(paths.gaps_json)
+    changed = False
+    if not isinstance(payload, dict):
+        payload = {
+            "objective_id": _as_text(objective_payload.get("objective_id")) or _new_objective_id(),
+            "gaps": [],
+            "updated_at": utc_now(),
+        }
+        changed = True
+    if _as_text(payload.get("objective_id")) != _as_text(objective_payload.get("objective_id")):
+        payload["objective_id"] = _as_text(objective_payload.get("objective_id")) or _new_objective_id()
+        changed = True
+    if not isinstance(payload.get("gaps"), list):
+        payload["gaps"] = []
+        changed = True
+    payload["updated_at"] = utc_now()
+    if changed:
+        write_json(paths.gaps_json, payload)
+    return payload, changed
 
 
 def _ensure_prd(
@@ -1091,6 +1771,79 @@ def _ensure_prd(
     return payload
 
 
+def _seed_tasks_from_prd(
+    *,
+    prd_payload: dict[str, Any],
+    project_root: Path,
+    target_branch: str,
+    objective_id: str,
+) -> list[dict[str, Any]]:
+    objective_title = _normalize_objective_title(_as_text(prd_payload.get("title"))) or f"{project_root.name} objective"
+
+    def _collect_sources(field: str) -> list[str]:
+        raw_items = prd_payload.get(field)
+        if not isinstance(raw_items, list):
+            return []
+        items: list[str] = []
+        for raw in raw_items:
+            candidate = _normalize_line(str(raw))
+            if candidate:
+                items.append(candidate[:220])
+        return items
+
+    seed_sources = _collect_sources("scope_in")
+    seed_kind = "scope_in"
+    if not seed_sources:
+        seed_sources = _collect_sources("success_criteria")
+        seed_kind = "success_criteria"
+    if not seed_sources:
+        seed_sources = _collect_sources("constraints")
+        seed_kind = "constraints"
+    if not seed_sources:
+        fallback_title = _normalize_line(objective_title)
+        if fallback_title:
+            seed_sources = [fallback_title]
+            seed_kind = "objective"
+
+    tasks: list[dict[str, Any]] = []
+    for idx, source in enumerate(seed_sources[:3]):
+        title = _strip_task_id_prefix(source) or f"{objective_title} slice {idx + 1}"
+        if seed_kind == "scope_in":
+            acceptance = [f"Complete the scoped slice: {title}."]
+            validation = [f"Run the smallest targeted proof for {title}."]
+        elif seed_kind == "success_criteria":
+            acceptance = [f"Satisfy the seeded success criterion: {title}."]
+            validation = [f"Prove the criterion with the narrowest applicable check for {title}."]
+        elif seed_kind == "constraints":
+            acceptance = [f"Honor the seeded constraint while completing the objective: {title}."]
+            validation = [f"Confirm the constraint remains satisfied after the slice for {title}."]
+        else:
+            acceptance = [f"Complete the objective slice: {title}."]
+            validation = [f"Run the smallest targeted proof for {title}."]
+        tasks.append(
+            _normalize_task_entry(
+                {
+                    "task_id": f"TT-{idx + 1:03d}",
+                    "title": title,
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root.resolve()),
+                    "target_branch": target_branch,
+                    "acceptance": acceptance,
+                    "validation": validation,
+                    "updated_at": utc_now(),
+                    "objective_id": objective_id,
+                },
+                index=idx,
+                project_root=project_root,
+                target_branch=target_branch,
+                objective_id=objective_id,
+            )
+        )
+    return tasks
+
+
 def _ensure_tasks_payload(
     *,
     paths,
@@ -1125,21 +1878,14 @@ def _ensure_tasks_payload(
             )
 
     if not tasks:
-        tasks = [
-            {
-                "task_id": "TT-001",
-                "title": "Execute the next concrete validated slice toward the active objective.",
-                "status": "open",
-                "priority": "p1",
-                "depends_on": [],
-                "project_root": str(project_root.resolve()),
-                "target_branch": target_branch,
-                "acceptance": ["Reach a concrete validated phase boundary for the active objective."],
-                "validation": ["Run the validations required for the active slice and record the resulting blocker or completion state."],
-                "updated_at": utc_now(),
-                "objective_id": objective_id,
-            }
-        ]
+        tasks = _seed_tasks_from_prd(
+            prd_payload=prd_payload,
+            project_root=project_root,
+            target_branch=target_branch,
+            objective_id=objective_id,
+        )
+        if not tasks:
+            raise ValueError("run_setup requires a concrete objective and task seed; generic TT-001 fallback is disabled.")
         changed = True
 
     payload["tasks"] = tasks
@@ -1169,6 +1915,90 @@ def _dependency_block_reason(task: dict[str, Any], done_ids: set[str]) -> str:
     if len(unresolved) > 3:
         unresolved = [*unresolved[:3], "..."]
     return f"waiting_on: {', '.join(unresolved)}"[:220]
+
+
+def _list_dirty_paths(project_root: Path) -> list[str]:
+    git_context = detect_git_context(project_root)
+    if not _as_text(git_context.get("git_root")):
+        return []
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(project_root), "status", "--short", "--untracked-files=all"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    if completed.returncode != 0:
+        return []
+    paths: list[str] = []
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.rstrip()
+        if len(line) < 4:
+            continue
+        payload = line[3:].strip()
+        if not payload:
+            continue
+        if " -> " in payload:
+            payload = payload.split(" -> ", 1)[1].strip()
+        normalized = payload.replace("\\", "/").lstrip("./")
+        if normalized:
+            paths.append(normalized)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(path)
+    return deduped
+
+
+def _clear_graph_frontier_blocks(tasks_payload: dict[str, Any]) -> bool:
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return False
+    changed = False
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        blocked_reason = _as_text(task.get("blocked_reason"))
+        if not blocked_reason.startswith("graph_frontier_waiting_on:"):
+            continue
+        if _as_text(task.get("status")).lower() == "blocked":
+            task["status"] = "open"
+            task["updated_at"] = utc_now()
+        task.pop("blocked_reason", None)
+        changed = True
+    return changed
+
+
+def _phase_rank(task: dict[str, Any], phase_boundaries: list[str]) -> int:
+    phase = _normalize_choice(task.get("deprecation_phase"), TASK_DEPRECATION_PHASES)
+    if not phase:
+        return len(phase_boundaries) + 1
+    try:
+        return phase_boundaries.index(phase)
+    except ValueError:
+        return len(phase_boundaries) + 1
+
+
+def _task_scope_size(task: dict[str, Any]) -> int:
+    return sum(
+        len(_normalize_text_list(task.get(key), item_chars=220, max_items=64))
+        for key in ("touch_paths", "spillover_paths", "coupling_notes", "acceptance", "validation")
+    )
+
+
+def _fanout_rank(task: dict[str, Any]) -> int:
+    fanout = _normalize_choice(task.get("fanout_risk"), TASK_FANOUT_RISKS)
+    return {"low": 0, "medium": 1, "high": 2}.get(fanout or "", 1)
+
+
+def _model_profile_rank(task: dict[str, Any]) -> int:
+    profile = _normalize_choice(task.get("model_profile"), TASK_MODEL_PROFILES)
+    return 0 if profile == "mini" else 1
 
 
 def _normalize_dependency_blockers(tasks_payload: dict[str, Any]) -> bool:
@@ -1245,6 +2075,148 @@ def _select_next_task(tasks_payload: dict[str, Any]) -> tuple[dict[str, Any] | N
     return None, "No dependency-resolved open tasks are currently available."
 
 
+def _graph_priority_rank(cluster_label: str, slice_priority: list[str]) -> int:
+    if not cluster_label:
+        return len(slice_priority) + 1
+    try:
+        return slice_priority.index(cluster_label)
+    except ValueError:
+        return len(slice_priority) + 1
+
+
+def _apply_graph_frontier(tasks_payload: dict[str, Any], *, selected_task_id: str) -> bool:
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list) or not selected_task_id:
+        return False
+    changed = False
+    blocked_reason = f"graph_frontier_waiting_on: {selected_task_id}"[:220]
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = _as_text(task.get("task_id"))
+        status = _as_text(task.get("status")).lower()
+        if task_id == selected_task_id:
+            if status == "blocked" and _as_text(task.get("blocked_reason")).startswith("graph_frontier_waiting_on:"):
+                task["status"] = "open"
+                task.pop("blocked_reason", None)
+                task["updated_at"] = utc_now()
+                changed = True
+            continue
+        if status == "open":
+            task["status"] = "blocked"
+            task["blocked_reason"] = blocked_reason
+            task["updated_at"] = utc_now()
+            changed = True
+        elif status == "blocked" and _as_text(task.get("blocked_reason")).startswith("graph_frontier_waiting_on:"):
+            if _as_text(task.get("blocked_reason")) != blocked_reason:
+                task["blocked_reason"] = blocked_reason
+                task["updated_at"] = utc_now()
+                changed = True
+    return changed
+
+
+def _select_next_task_graph_first(
+    *,
+    tasks_payload: dict[str, Any],
+    project_root: Path,
+    paths,
+    dirty_paths: list[str],
+) -> tuple[dict[str, Any] | None, str, dict[str, Any] | None, dict[str, Any] | None]:
+    config = load_graph_config_for_project(project_root)
+    if not isinstance(config, dict):
+        task, reason = _select_next_task(tasks_payload)
+        return task, reason, None, None
+
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return None, "No tasks registry available.", None, config
+    done_ids: set[str] = {
+        str(task.get("task_id", "")).strip()
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("status", "")).strip().lower() == "done"
+    }
+    open_tasks = [
+        task for task in tasks if isinstance(task, dict) and str(task.get("status", "")).strip().lower() == "open"
+    ]
+    if not open_tasks:
+        return None, "No open tasks remain in TASKS.json.", None, config
+    candidate_tasks = [task for task in open_tasks if not _task_marked_superseded(task)]
+    if not candidate_tasks:
+        candidate_tasks = open_tasks
+    eligible = [task for task in candidate_tasks if _task_depends_resolved(task, done_ids)]
+    if not eligible:
+        return None, "No dependency-resolved open tasks are currently available.", None, config
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for task in eligible:
+        task_id = _as_text(task.get("task_id"))
+        if not task_id:
+            continue
+        summaries[task_id] = summarize_task_graph_slice(
+            project_root=project_root,
+            paths=paths,
+            task=task,
+            dirty_paths=dirty_paths,
+        )
+
+    dominant_dirty_cluster = None
+    if _as_text(config.get("graph_policy")) == "hybrid" and dirty_paths:
+        counts: dict[str, int] = {}
+        for summary in summaries.values():
+            label = _as_text(summary.get("graph_cluster_label"))
+            overlap = int(summary.get("dirty_overlap_count") or 0)
+            if label and overlap > 0:
+                counts[label] = max(counts.get(label, 0), overlap)
+        if counts:
+            ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            if len(ranked) == 1 or ranked[0][1] > ranked[1][1]:
+                dominant_dirty_cluster = ranked[0][0]
+
+    slice_priority = [str(item).strip() for item in config.get("slice_priority", []) if str(item).strip()]
+    phase_boundaries = [str(item).strip() for item in config.get("phase_boundaries", []) if str(item).strip()]
+
+    def sort_key(task: dict[str, Any]) -> tuple[Any, ...]:
+        task_id = _as_text(task.get("task_id"))
+        summary = summaries.get(task_id, {})
+        cluster_label = _as_text(summary.get("graph_cluster_label"))
+        adjacent_count = len(summary.get("graph_adjacent_families_top3", []) or [])
+        boundary_count = len(summary.get("graph_boundary_warnings_top3", []) or [])
+        dirty_overlap = int(summary.get("dirty_overlap_count") or 0)
+        priority = _task_priority_rank(str(task.get("priority", "p1")))
+        updated = _parse_iso_ts(task.get("updated_at"))
+        dirty_rank = 1
+        if dominant_dirty_cluster and cluster_label == dominant_dirty_cluster and dirty_overlap > 0:
+            dirty_rank = 0
+        return (
+            _phase_rank(task, phase_boundaries),
+            dirty_rank,
+            -dirty_overlap if dirty_rank == 0 else 0,
+            _graph_priority_rank(cluster_label, slice_priority),
+            adjacent_count + boundary_count,
+            _fanout_rank(task),
+            _model_profile_rank(task),
+            _task_scope_size(task),
+            priority,
+            updated,
+            task_id,
+        )
+
+    chosen = sorted(eligible, key=sort_key)[0]
+    chosen_summary = summaries.get(_as_text(chosen.get("task_id"))) or {}
+    reason = _as_text(chosen_summary.get("graph_slice_reason"))
+    if reason:
+        return chosen, reason, chosen_summary, config
+    cluster_label = _as_text(chosen_summary.get("graph_cluster_label"))
+    if cluster_label:
+        return (
+            chosen,
+            f"Graph-first selection kept one actionable `{cluster_label}` slice after sequencing, dependency, and decoupling checks.",
+            chosen_summary,
+            config,
+        )
+    return chosen, "Graph-enabled selection chose the smallest dependency-safe slice.", chosen_summary, config
+
+
 def _find_task_index(tasks_payload: dict[str, Any], task_id: str) -> int:
     tasks = tasks_payload.get("tasks")
     if not isinstance(tasks, list):
@@ -1315,6 +2287,83 @@ def _looks_like_done_closeout_task(task: dict[str, Any]) -> bool:
     return any(hint in combined for hint in hints)
 
 
+def _has_completed_done_closeout_task(tasks_payload: dict[str, Any]) -> bool:
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return False
+    for raw in tasks:
+        if not isinstance(raw, dict):
+            continue
+        if _as_text(raw.get("status")).lower() == "done" and _looks_like_done_closeout_task(raw):
+            return True
+    return False
+
+
+def _next_closeout_task_id(tasks_payload: dict[str, Any]) -> str:
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return "TT-001"
+    max_index = 0
+    for raw in tasks:
+        if not isinstance(raw, dict):
+            continue
+        task_id = _as_text(raw.get("task_id"))
+        match = re.fullmatch(r"TT-(\d+)", task_id)
+        if not match:
+            continue
+        max_index = max(max_index, int(match.group(1)))
+    return f"TT-{max_index + 1:03d}"
+
+
+def _ensure_done_closeout_task(
+    *,
+    tasks_payload: dict[str, Any],
+    project_root: Path,
+    target_branch: str,
+    objective_id: str,
+) -> tuple[str | None, bool]:
+    tasks = tasks_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return None, False
+
+    for raw in tasks:
+        if not isinstance(raw, dict) or not _looks_like_done_closeout_task(raw):
+            continue
+        changed = False
+        if _as_text(raw.get("status")).lower() != "open":
+            raw["status"] = "open"
+            raw["updated_at"] = utc_now()
+            changed = True
+        if "blocked_reason" in raw:
+            raw.pop("blocked_reason", None)
+            changed = True
+        return _as_text(raw.get("task_id")) or None, changed
+
+    task_id = _next_closeout_task_id(tasks_payload)
+    tasks.append(
+        {
+            "task_id": task_id,
+            "title": "Run final done-closeout `run_gates` check before closing the objective.",
+            "status": "open",
+            "priority": "p1",
+            "depends_on": [],
+            "project_root": str(project_root.resolve()),
+            "target_branch": target_branch,
+            "objective_id": objective_id,
+            "model_profile": "mini",
+            "acceptance": [
+                "Complete: No open runner tasks remain after the active backlog has been safely cleared.",
+                "Complete: Final done-closeout `run_gates` validation passes before the runner writes `RUNNER_DONE.lock`.",
+            ],
+            "validation": [
+                "Run final done-state gate check (`run_gates`).",
+            ],
+            "updated_at": utc_now(),
+        }
+    )
+    return task_id, True
+
+
 def _enforce_branch(project_root: Path, target_branch: str) -> tuple[bool, str]:
     branch = target_branch.strip()
     if not branch:
@@ -1355,7 +2404,7 @@ def _derive_runner_phase(
     context_digest: str | None,
 ) -> str:
     previous_phase = coerce_runner_phase(state.get("current_phase"), default="discover")
-    if open_tasks_count == 0 or "done-closeout" in next_task_text.lower() or done_gate_status_value == "failed":
+    if open_tasks_count == 0 or "done-closeout" in next_task_text.lower() or done_gate_status_value in {"failed", "passed"}:
         return "closeout"
     blocker_text = " ".join([next_task_text, selection_reason, *blockers]).lower()
     if status_value == "blocked" or any(token in blocker_text for token in ("verify", "validation", "typecheck", "test", "lint", "harness", "blocked")):
@@ -1407,10 +2456,14 @@ def _build_phase_context_delta(
     touch_paths: list[str],
     validation_commands: list[str],
     coupling_notes: list[str],
+    parity_baseline_ref: str | None,
+    parity_surface_ids: list[str],
+    parity_audit_mode: str | None,
 ) -> dict[str, Any]:
     return {
         "phase": phase,
         "objective_title": objective_title,
+        "active_seam_id": next_task_id,
         "next_task_id": next_task_id,
         "next_task": next_task_text,
         "next_task_reason": selection_reason,
@@ -1425,6 +2478,9 @@ def _build_phase_context_delta(
         "touch_paths_top8": touch_paths[:8],
         "validation_commands_top3": validation_commands[:3],
         "coupling_notes_top4": coupling_notes[:4],
+        "parity_baseline_ref": parity_baseline_ref,
+        "parity_surface_ids_top3": parity_surface_ids[:3],
+        "parity_audit_mode": parity_audit_mode,
         "open_tasks_count": open_tasks_count,
         "done_gate_status": done_gate_status_value,
         "phase_status": phase_status,
@@ -1473,8 +2529,12 @@ def _write_exec_context(
     phase_goal: str,
     context_sources: list[dict[str, Any]],
     context_delta: dict[str, Any],
+    graph_summary: dict[str, Any] | None = None,
+    parity_scope: dict[str, Any] | None = None,
 ) -> None:
     existing_exec_context = read_json(paths.exec_context_json) or {}
+    graph_summary = graph_summary if isinstance(graph_summary, dict) else {}
+    parity_scope = parity_scope if isinstance(parity_scope, dict) else {}
     current_snapshot = _capture_progress_snapshot(state=state, project_root=project_root, tasks_payload=tasks_payload)
     preserved_cycle_baseline = (
         existing_exec_context.get("cycle_progress_baseline")
@@ -1515,11 +2575,7 @@ def _write_exec_context(
     coupling_notes = (
         _normalize_text_list(task.get("coupling_notes"), item_chars=220, max_items=8) if isinstance(task, dict) else []
     )
-    parity_fail_closed = _looks_like_strict_parity_task(
-        title=task_title,
-        acceptance=[str(item) for item in acceptance if str(item).strip()],
-        validation=[str(item) for item in validation if str(item).strip()],
-    )
+    parity_fail_closed = bool(parity_scope.get("parity_fail_closed", False))
     hard_rules = [
         "stay_within_phase_goal",
         "validate_as_you_go",
@@ -1533,8 +2589,14 @@ def _write_exec_context(
         "objective_id": _as_text(prd_payload.get("objective_id")),
         "phase": phase,
         "phase_goal": phase_goal,
+        "seam_id": task_id or None,
         "task_id": task_id or None,
+        "active_seam_id": _as_text(state.get("active_seam_id")) or task_id or None,
+        "seam_title": task_title or None,
         "task_title": task_title or None,
+        "next_seam_id": _as_text(state.get("next_seam_id") or state.get("next_task_id")) or None,
+        "next_seam": _as_text(state.get("next_seam") or state.get("next_task")) or None,
+        "next_seam_reason": _as_text(state.get("next_seam_reason") or state.get("next_task_reason")) or None,
         "next_task_id": _as_text(state.get("next_task_id")) or None,
         "next_task": _as_text(state.get("next_task")) or None,
         "next_task_reason": _as_text(state.get("next_task_reason")) or None,
@@ -1548,6 +2610,39 @@ def _write_exec_context(
         "validation_commands": validation_commands,
         "spillover_paths": spillover_paths,
         "coupling_notes": coupling_notes,
+        "parity_enabled": bool(parity_scope.get("parity_enabled", False)),
+        "parity_baseline_ref": _as_text(parity_scope.get("parity_baseline_ref")) or None,
+        "parity_surface_ids": [
+            str(item).strip()
+            for item in parity_scope.get("parity_surface_ids", [])
+            if str(item).strip()
+        ],
+        "parity_surfaces": parity_scope.get("parity_surfaces", []),
+        "parity_audit_mode": _as_text(parity_scope.get("parity_audit_mode")) or None,
+        "parity_harness_commands": [
+            str(item).strip()
+            for item in parity_scope.get("parity_harness_commands", [])
+            if str(item).strip()
+        ],
+        "parity_fail_closed": bool(parity_scope.get("parity_fail_closed", False)),
+        "parity_trigger_reason": _as_text(parity_scope.get("parity_trigger_reason")) or None,
+        "parity_notes": _as_text(parity_scope.get("parity_notes")) or None,
+        "parity_policy": parity_scope.get("parity_policy", {}),
+        "graph_enabled": bool(graph_summary.get("graph_enabled", False)),
+        "graph_digest": _as_text(graph_summary.get("graph_digest")) or None,
+        "graph_active_slice_digest": _as_text(graph_summary.get("graph_active_slice_digest")) or None,
+        "graph_cluster_label": _as_text(graph_summary.get("graph_cluster_label")) or None,
+        "graph_slice_reason": _as_text(graph_summary.get("graph_slice_reason")) or None,
+        "graph_adjacent_families_top3": [
+            str(item).strip()
+            for item in graph_summary.get("graph_adjacent_families_top3", [])
+            if str(item).strip()
+        ][:3],
+        "graph_boundary_warnings_top3": [
+            str(item).strip()
+            for item in graph_summary.get("graph_boundary_warnings_top3", [])
+            if str(item).strip()
+        ][:3],
         "project_root": str(project_root.resolve()),
         "target_branch": target_branch or None,
         "state_revision": int(state.get("state_revision", 0)),
@@ -1604,6 +2699,8 @@ def _write_prepared_cycle_marker(
         "phase": phase,
         "handoff_reason": handoff_reason,
         "budget_exhausted": budget_exhausted,
+        "next_seam_id": _as_text(state.get("next_seam_id") or state.get("next_task_id")) or None,
+        "next_seam": _as_text(state.get("next_seam") or state.get("next_task")) or None,
         "next_task_id": _as_text(state.get("next_task_id")) or None,
         "next_task": _as_text(state.get("next_task")) or None,
         "state_revision": int(state.get("state_revision", 0)),
@@ -1631,13 +2728,26 @@ def _active_backlog_digest(tasks_payload: dict[str, Any] | None) -> str | None:
                 "task_id": _as_text(raw.get("task_id")) or None,
                 "title": _as_text(raw.get("title")) or None,
                 "status": status or None,
+                "priority": _as_text(raw.get("priority")) or None,
                 "blocked_reason": _as_text(raw.get("blocked_reason")) or None,
                 "depends_on": [str(item).strip() for item in raw.get("depends_on", []) if str(item).strip()],
                 "acceptance": [str(item).strip() for item in raw.get("acceptance", []) if str(item).strip()],
                 "validation": [str(item).strip() for item in raw.get("validation", []) if str(item).strip()],
                 "model_profile": _as_text(raw.get("model_profile")) or None,
+                "profile_reason": _as_text(raw.get("profile_reason")) or None,
+                "fanout_risk": _as_text(raw.get("fanout_risk")) or None,
+                "deprecation_phase": _as_text(raw.get("deprecation_phase")) or None,
                 "touch_paths": [str(item).strip() for item in raw.get("touch_paths", []) if str(item).strip()],
+                "validation_commands": [
+                    str(item).strip() for item in raw.get("validation_commands", []) if str(item).strip()
+                ],
+                "spillover_paths": [str(item).strip() for item in raw.get("spillover_paths", []) if str(item).strip()],
                 "coupling_notes": [str(item).strip() for item in raw.get("coupling_notes", []) if str(item).strip()],
+                "objective_id": _as_text(raw.get("objective_id")) or None,
+                "parity_baseline_ref": _as_text(raw.get("parity_baseline_ref")) or None,
+                "parity_surface_ids": [str(item).strip() for item in raw.get("parity_surface_ids", []) if str(item).strip()],
+                "parity_audit_mode": _as_text(raw.get("parity_audit_mode")) or None,
+                "parity_notes": _as_text(raw.get("parity_notes")) or None,
             }
         )
     if not active_entries:
@@ -1657,6 +2767,9 @@ def _capture_progress_snapshot(
     return {
         "phase": coerce_runner_phase(state.get("current_phase"), default="discover"),
         "phase_status": _as_text(state.get("phase_status")) or None,
+        "active_seam_id": _as_text(state.get("active_seam_id")) or None,
+        "next_seam_id": _as_text(state.get("next_seam_id") or state.get("next_task_id")) or None,
+        "next_seam": _as_text(state.get("next_seam") or state.get("next_task")) or None,
         "next_task_id": _as_text(state.get("next_task_id")) or None,
         "next_task": _as_text(state.get("next_task")) or None,
         "status": _as_text(state.get("status")) or None,
@@ -1674,6 +2787,9 @@ def _progress_has_advanced(*, baseline: dict[str, Any] | None, current: dict[str
             coerce_runner_phase(baseline.get("phase"), default="discover")
             != coerce_runner_phase(current.get("phase"), default="discover"),
             _as_text(baseline.get("phase_status")) != _as_text(current.get("phase_status")),
+            _as_text(baseline.get("active_seam_id")) != _as_text(current.get("active_seam_id")),
+            _as_text(baseline.get("next_seam_id")) != _as_text(current.get("next_seam_id")),
+            _as_text(baseline.get("next_seam")) != _as_text(current.get("next_seam")),
             _as_text(baseline.get("next_task_id")) != _as_text(current.get("next_task_id")),
             _as_text(baseline.get("next_task")) != _as_text(current.get("next_task")),
             _as_text(baseline.get("status")) != _as_text(current.get("status")),
@@ -1924,29 +3040,116 @@ def create_runner_state(
         tasks_changed = True
     if tasks_changed:
         created.append(str(paths.tasks_json.relative_to(paths.memory_dir)))
+    objective_payload, objective_changed = _ensure_objective_payload(
+        paths=paths,
+        state=state,
+        project=project,
+        project_root=project_root,
+        prd_payload=prd_payload,
+    )
+    if objective_changed:
+        created.append(str(paths.objective_json.relative_to(paths.memory_dir)))
+    seams_payload, seams_changed = _ensure_seams_payload(
+        paths=paths,
+        objective_payload=objective_payload,
+        tasks_payload=tasks_payload,
+    )
+    if seams_changed:
+        created.append(str(paths.seams_json.relative_to(paths.memory_dir)))
+    gaps_payload, gaps_changed = _ensure_gaps_payload(
+        paths=paths,
+        objective_payload=objective_payload,
+    )
+    if gaps_changed:
+        created.append(str(paths.gaps_json.relative_to(paths.memory_dir)))
+    tasks_payload = _build_tasks_from_seams(
+        seams_payload=seams_payload,
+        project_root=project_root,
+        target_branch=branch_guess,
+        objective_id=_as_text(objective_payload.get("objective_id")) or _new_objective_id(),
+    )
+    write_json(paths.tasks_json, tasks_payload)
+    parity_payload, parity_changed = _ensure_runner_parity_payload(
+        paths=paths,
+        prd_payload=prd_payload,
+        tasks_payload=tasks_payload,
+        project_root=project_root,
+    )
+    if parity_changed:
+        created.append(str(paths.runner_parity_json.relative_to(paths.memory_dir)))
 
     if _normalize_dependency_blockers(tasks_payload):
         tasks_changed = True
         write_json(paths.tasks_json, tasks_payload)
+        seams_payload = _build_seams_from_tasks(
+            tasks_payload=tasks_payload,
+            objective_id=_as_text(objective_payload.get("objective_id")) or _new_objective_id(),
+        )
+        write_json(paths.seams_json, seams_payload)
+    if _clear_graph_frontier_blocks(tasks_payload):
+        tasks_changed = True
+        write_json(paths.tasks_json, tasks_payload)
+        seams_payload = _build_seams_from_tasks(
+            tasks_payload=tasks_payload,
+            objective_id=_as_text(objective_payload.get("objective_id")) or _new_objective_id(),
+        )
+        write_json(paths.seams_json, seams_payload)
 
     closeout_gate_result: tuple[bool | None, str] | None = None
-    open_task_candidates = _open_task_entries(tasks_payload)
-    if len(open_task_candidates) == 1 and _looks_like_done_closeout_task(open_task_candidates[0]):
+    synthesized_closeout_task = False
+    preserve_done_state = (
+        paths.done_lock.exists() or (previous_done_gate == "passed" and (previous_done_candidate or previous_status == "done"))
+    ) and _has_completed_done_closeout_seam(seams_payload)
+    open_task_candidates = _open_seam_entries(seams_payload)
+    if not open_task_candidates and not preserve_done_state:
+        _, closeout_task_changed = _ensure_done_closeout_seam(
+            seams_payload=seams_payload,
+            project_root=project_root,
+            target_branch=branch_guess,
+            objective_id=_as_text(objective_payload.get("objective_id")) or _new_objective_id(),
+        )
+        if closeout_task_changed:
+            synthesized_closeout_task = True
+            tasks_changed = True
+            tasks_payload = _build_tasks_from_seams(
+                seams_payload=seams_payload,
+                project_root=project_root,
+                target_branch=branch_guess,
+                objective_id=_as_text(objective_payload.get("objective_id")) or _new_objective_id(),
+            )
+            write_json(paths.tasks_json, tasks_payload)
+            write_json(paths.seams_json, seams_payload)
+        open_task_candidates = _open_seam_entries(seams_payload)
+    if (
+        not synthesized_closeout_task
+        and len(open_task_candidates) == 1
+        and _looks_like_done_closeout_task(
+            {
+                "title": _as_text(open_task_candidates[0].get("title")),
+                "acceptance": open_task_candidates[0].get("acceptance") or [],
+                "validation": open_task_candidates[0].get("checks") or [],
+            }
+        )
+    ):
         closeout_gate_result = _run_done_closeout_gates(
             project_root=project_root,
             gates_file=paths.gates_file,
             runner_id=runner_id,
         )
-        if closeout_gate_result[0] is True:
-            closeout_task_id = _as_text(open_task_candidates[0].get("task_id"))
-            if closeout_task_id and _set_task_status(
-                tasks_payload=tasks_payload,
-                task_id=closeout_task_id,
-                status="done",
-            ):
-                tasks_changed = True
 
-    selected_task, selection_reason = _select_next_task(tasks_payload)
+    dirty_paths = _list_dirty_paths(project_root)
+    build_runner_graph_artifacts(
+        project_root=project_root,
+        paths=paths,
+        selected_task=None,
+        dirty_paths=dirty_paths,
+    )
+    selected_task, selection_reason, graph_summary, graph_config = _select_next_task_graph_first(
+        tasks_payload=tasks_payload,
+        project_root=project_root,
+        paths=paths,
+        dirty_paths=dirty_paths,
+    )
     target_branch = branch_guess
     if isinstance(selected_task, dict):
         task_branch = str(selected_task.get("target_branch", "")).strip()
@@ -1966,20 +3169,64 @@ def create_runner_state(
                     blocked_reason=f"branch_enforcement_failed: {branch_error}",
                 )
                 write_json(paths.tasks_json, tasks_payload)
+                seams_payload = _build_seams_from_tasks(
+                    tasks_payload=tasks_payload,
+                    objective_id=_as_text(objective_payload.get("objective_id")) or _new_objective_id(),
+                )
+                write_json(paths.seams_json, seams_payload)
             selected_task = None
             selection_reason = "Branch enforcement failed; selected task moved to blocked."
 
+    if (
+        isinstance(selected_task, dict)
+        and isinstance(graph_config, dict)
+        and _as_text(graph_config.get("actionable_frontier")) == "one_open"
+    ):
+        selected_task_id = _as_text(selected_task.get("task_id"))
+        if selected_task_id and _apply_graph_frontier(tasks_payload, selected_task_id=selected_task_id):
+            tasks_changed = True
+            write_json(paths.tasks_json, tasks_payload)
+            seams_payload = _build_seams_from_tasks(
+                tasks_payload=tasks_payload,
+                objective_id=_as_text(objective_payload.get("objective_id")) or _new_objective_id(),
+            )
+            write_json(paths.seams_json, seams_payload)
+            selected_task, selection_reason, graph_summary, graph_config = _select_next_task_graph_first(
+                tasks_payload=tasks_payload,
+                project_root=project_root,
+                paths=paths,
+                dirty_paths=dirty_paths,
+            )
+
     git_context = detect_git_context(project_root)
     objective_id = _as_text(prd_payload.get("objective_id")) or _new_objective_id()
+    previous_objective_id = _as_text(previous_state.get("objective_id"))
+    objective_changed = bool(previous_objective_id and previous_objective_id != objective_id)
     objective_title = _normalize_objective_title(_as_text(prd_payload.get("title"))) or f"{project} runner objective"
-    open_tasks_count = count_open_tasks(tasks_payload)
+    open_tasks_count = count_open_seams(seams_payload)
 
     next_task_id = _as_text(selected_task.get("task_id")) if isinstance(selected_task, dict) else None
     next_task_title = _as_text(selected_task.get("title")) if isinstance(selected_task, dict) else ""
+    active_seam_id = next_task_id or _as_text(seams_payload.get("active_seam_id")) or None
+    selected_parity_scope = _resolve_task_parity_scope(
+        task=selected_task if isinstance(selected_task, dict) else None,
+        parity_payload=parity_payload,
+        title=next_task_title,
+        acceptance=[
+            str(item).strip()
+            for item in ((selected_task or {}).get("acceptance") if isinstance(selected_task, dict) else [])
+            if str(item).strip()
+        ],
+        validation=[
+            str(item).strip()
+            for item in ((selected_task or {}).get("validation") if isinstance(selected_task, dict) else [])
+            if str(item).strip()
+        ],
+    )
     if next_task_title:
         next_task_text = next_task_title
     elif open_tasks_count == 0:
-        next_task_text = "No open tasks remain in TASKS.json."
+        next_task_text = DONE_NEXT_TASK_TEXT
     else:
         next_task_text = "No executable open task is currently available."
 
@@ -1997,12 +3244,27 @@ def create_runner_state(
     status_value = "ready"
     done_candidate_value = False
     done_gate_status_value = "pending"
+    if closeout_gate_result is not None and open_tasks_count > 0:
+        gates_ok, gates_output = closeout_gate_result
+        if gates_ok is True:
+            done_gate_status_value = "passed"
+            selection_reason = (
+                "Final done-closeout validation is already green; keep the explicit closeout task "
+                "open until the runner converges cleanly and marks done from a closeout cycle."
+            )
+        elif gates_ok is False:
+            done_gate_status_value = "failed"
+            next_task_text = "Resolve final done-closeout gate failure."
+            selection_reason = "Final done-closeout validation is failing while the closeout task remains open."
+            blockers.append(f"Final done closeout blocked: {_summarize_gate_failure(gates_output)}"[:220])
+            blockers = blockers[-8:]
+        elif gates_ok is None:
+            done_gate_status_value = "pending"
+            next_task_text = "Resolve final done-closeout validation prerequisites."
+            selection_reason = "Final done-closeout validation could not run yet while the closeout task remains open."
     if open_tasks_count == 0:
         blockers = []
     if open_tasks_count == 0:
-        preserve_done_state = paths.done_lock.exists() or (
-            previous_done_gate == "passed" and (previous_done_candidate or previous_status == "done")
-        )
         if preserve_done_state:
             status_value = "done"
             done_candidate_value = True
@@ -2051,6 +3313,12 @@ def create_runner_state(
         state=state,
         tasks_payload=tasks_payload,
     )
+    graph_summary = build_runner_graph_artifacts(
+        project_root=project_root,
+        paths=paths,
+        selected_task=selected_task if isinstance(selected_task, dict) else None,
+        dirty_paths=dirty_paths,
+    )
     context_sources = _collect_context_sources(project_root)
     phase_context_digest = _digest_text(
         "|".join(str(source.get("digest", "")) for source in context_sources if str(source.get("digest", "")).strip())
@@ -2068,7 +3336,11 @@ def create_runner_state(
     )
     previous_phase = coerce_runner_phase(state.get("current_phase"), default="discover")
     previous_phase_started_at = _as_text(state.get("phase_started_at"))
-    phase_started_at = previous_phase_started_at if current_phase == previous_phase and previous_phase_started_at else utc_now()
+    phase_started_at = (
+        previous_phase_started_at
+        if current_phase == previous_phase and previous_phase_started_at and not objective_changed
+        else utc_now()
+    )
     phase_status = "active"
     if status_value == "blocked":
         phase_status = "blocked"
@@ -2097,8 +3369,8 @@ def create_runner_state(
         open_tasks_count=open_tasks_count,
         done_gate_status_value=done_gate_status_value,
         phase_status=phase_status,
-        completed_recent=[str(item).strip() for item in state.get("completed_recent", []) if str(item).strip()],
-        last_iteration_summary=_as_text(state.get("last_iteration_summary")),
+        completed_recent=[] if objective_changed else [str(item).strip() for item in state.get("completed_recent", []) if str(item).strip()],
+        last_iteration_summary="" if objective_changed else _as_text(state.get("last_iteration_summary")),
         task_acceptance=[
             str(item).strip()
             for item in ((selected_task or {}).get("acceptance") if isinstance(selected_task, dict) else [])
@@ -2134,6 +3406,13 @@ def create_runner_state(
             if isinstance(selected_task, dict)
             else []
         ),
+        parity_baseline_ref=_as_text(selected_parity_scope.get("parity_baseline_ref")) or None,
+        parity_surface_ids=[
+            str(item).strip()
+            for item in selected_parity_scope.get("parity_surface_ids", [])
+            if str(item).strip()
+        ],
+        parity_audit_mode=_as_text(selected_parity_scope.get("parity_audit_mode")) or None,
     )
 
     state = update_state(
@@ -2142,18 +3421,27 @@ def create_runner_state(
         status=status_value,
         current_step="",
         current_goal=objective_title,
+        next_seam=next_task_text,
+        next_seam_reason=selection_reason,
         next_task=next_task_text,
         next_task_reason=selection_reason,
         implementation_plan=implementation_plan,
+        completed_recent=[] if objective_changed else [str(item).strip() for item in state.get("completed_recent", []) if str(item).strip()],
+        last_iteration_summary="" if objective_changed else _as_text(state.get("last_iteration_summary")),
         objective_id=objective_id,
+        next_seam_id=next_task_id,
         next_task_id=next_task_id,
+        active_seam_id=active_seam_id,
+        current_seam_id=active_seam_id,
         current_task_id=None,
+        seam_selection_reason=selection_reason,
         task_selection_reason=selection_reason,
         project_root=str(project_root.resolve()),
         target_branch=target_branch,
         state_revision=state_revision,
         done_candidate=done_candidate_value,
         done_gate_status=done_gate_status_value,
+        dod_status="done" if status_value == "done" else "in_progress",
         current_phase=current_phase,
         phase_status=phase_status,
         phase_started_at=phase_started_at,
@@ -2185,6 +3473,8 @@ def create_runner_state(
         tasks_payload=tasks_payload,
         selected_task=selected_task if isinstance(selected_task, dict) else None,
         phase_goal=phase_goal,
+        graph_summary=graph_summary,
+        parity_scope=selected_parity_scope,
     )
     context_sources = _collect_context_sources(project_root)
     phase_context_digest = _digest_text(
@@ -2206,6 +3496,8 @@ def create_runner_state(
         phase_goal=phase_goal,
         context_sources=context_sources,
         context_delta=context_delta,
+        graph_summary=graph_summary,
+        parity_scope=selected_parity_scope,
     )
 
     if not paths.ledger_file.exists():
@@ -2384,11 +3676,35 @@ def _inspect_runner_start_state(
     if not isinstance(state, dict):
         return {
             "ok": False,
-            "error": "Runner is not set up. Run /prompts:run_setup first.",
+            "error": "Runner is not prepared. Run /prompts:run_setup first to compile the objective bundle.",
             "project": project,
             "runner_id": runner_id,
             "project_root": str(resolved_root),
         }
+
+    objective_payload = read_json(paths.objective_json)
+    seams_payload = read_json(paths.seams_json)
+    gaps_payload = read_json(paths.gaps_json)
+    if not isinstance(objective_payload, dict) or not isinstance(seams_payload, dict) or not isinstance(gaps_payload, dict):
+        return {
+            "ok": False,
+            "error": (
+                "Runner objective bundle is missing or invalid. "
+                "Run /prompts:run_setup first to prepare OBJECTIVE.json, SEAMS.json, and GAPS.json."
+            ),
+            "project": project,
+            "runner_id": runner_id,
+            "project_root": str(resolved_root),
+        }
+
+    objective_id = _as_text(objective_payload.get("objective_id")) or _as_text(state.get("objective_id")) or _new_objective_id()
+    derived_seams_payload = _seams_payload_from_tasks_file(paths=paths, objective_id=objective_id)
+    if isinstance(derived_seams_payload, dict):
+        current_digest = json.dumps(seams_payload, sort_keys=True)
+        derived_digest = json.dumps(derived_seams_payload, sort_keys=True)
+        if current_digest != derived_digest:
+            seams_payload = derived_seams_payload
+            write_json(paths.seams_json, seams_payload)
 
     status = str(state.get("status", "")).strip().lower()
     if paths.done_lock.exists() or status == "done":
@@ -2502,17 +3818,16 @@ def _inspect_runner_start_state(
             "project_root": str(resolved_root),
         }
 
-    tasks_payload = read_json(paths.tasks_json)
-    tasks = tasks_payload.get("tasks", []) if isinstance(tasks_payload, dict) else []
-    matching_task = None
-    if isinstance(tasks, list):
-        for task in tasks:
-            if not isinstance(task, dict):
+    seams = seams_payload.get("seams", []) if isinstance(seams_payload, dict) else []
+    matching_seam = None
+    if isinstance(seams, list):
+        for seam in seams:
+            if not isinstance(seam, dict):
                 continue
-            if _as_text(task.get("task_id")) == next_task_id:
-                matching_task = task
+            if _as_text(seam.get("seam_id")) == next_task_id:
+                matching_seam = seam
                 break
-    if matching_task is None:
+    if matching_seam is None:
         if allow_refresh_repair:
             create_runner_state(
                 dev=dev,
@@ -2530,19 +3845,19 @@ def _inspect_runner_start_state(
             )
         return {
             "ok": False,
-            "error": f"Runner task {next_task_id} is missing from TASKS.json. Run /prompts:run_setup again.",
+            "error": f"Runner seam {next_task_id} is missing from SEAMS.json. Run /prompts:run_setup again.",
             "project": project,
             "runner_id": runner_id,
             "project_root": str(resolved_root),
         }
 
-    task_status = _as_text(matching_task.get("status")).lower()
+    task_status = _as_text(matching_seam.get("status")).lower()
     if task_status == "blocked":
-        blocked_reason = _as_text(matching_task.get("blocked_reason"))
+        blocked_reason = _as_text(matching_seam.get("blocked_reason"))
         blocked_suffix = f" Reason: {blocked_reason}." if blocked_reason else ""
         return {
             "ok": False,
-            "error": f"Runner task {next_task_id} is blocked.{blocked_suffix}",
+            "error": f"Runner seam {next_task_id} is blocked.{blocked_suffix}",
             "project": project,
             "runner_id": runner_id,
             "project_root": str(resolved_root),
@@ -2566,7 +3881,7 @@ def _inspect_runner_start_state(
             )
         return {
             "ok": False,
-            "error": f"Runner task {next_task_id} is not startable (status={task_status or 'unknown'}).",
+            "error": f"Runner seam {next_task_id} is not startable (status={task_status or 'unknown'}).",
             "project": project,
             "runner_id": runner_id,
             "project_root": str(resolved_root),
@@ -2579,6 +3894,10 @@ def _inspect_runner_start_state(
         "project_root": str(resolved_root),
         "state_file": str(paths.state_file),
         "tasks_file": str(paths.tasks_json),
+        "objective_file": str(paths.objective_json),
+        "seams_file": str(paths.seams_json),
+        "gaps_file": str(paths.gaps_json),
+        "active_seam_id": _as_text(state.get("active_seam_id")) or next_task_id,
         "next_task_id": next_task_id,
         "next_task": next_task,
     }
@@ -2910,7 +4229,7 @@ def _handle_task_command(
         normalized_priority = (priority or "p1").strip().lower()
         if normalized_priority not in TASK_PRIORITY_ORDER:
             return 1, "ERROR: --priority must be one of p0|p1|p2|p3"
-        state = load_or_init_state(paths=paths, project=project, runner_id=runner_id)
+        state = load_state_snapshot(paths=paths, project=project, runner_id=runner_id)
         pending_entries = _iter_pending_intake_entries(paths)
         known_ids = _collect_known_task_ids(tasks_payload, pending_entries)
 
@@ -3011,15 +4330,25 @@ def _handle_objective_command(
     if not isinstance(prd_payload, dict):
         prd_payload = _default_prd(state, project=project, project_root=project_root)
         write_json(paths.prd_json, prd_payload)
+    objective_payload, _ = _ensure_objective_payload(
+        paths=paths,
+        state=state,
+        project=project,
+        project_root=project_root,
+        prd_payload=prd_payload,
+    )
 
     if action == "show":
-        return 0, json.dumps(prd_payload, indent=2, sort_keys=True)
+        return 0, json.dumps(objective_payload, indent=2, sort_keys=True)
 
     if action == "set":
         if not objective_id:
             return 1, "ERROR: --objective-id is required for --objective set"
+        objective_payload["objective_id"] = objective_id.strip()
+        objective_payload["updated_at"] = utc_now()
         prd_payload["objective_id"] = objective_id.strip()
         prd_payload["updated_at"] = utc_now()
+        write_json(paths.objective_json, objective_payload)
         write_json(paths.prd_json, prd_payload)
         update_state(paths.state_file, state, objective_id=objective_id.strip())
         return 0, f"objective_updated={objective_id.strip()}"

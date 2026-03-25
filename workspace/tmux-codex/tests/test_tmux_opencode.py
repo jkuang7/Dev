@@ -66,7 +66,7 @@ class TmuxClientTests(unittest.TestCase):
         client = TmuxClient()
         client._run = Mock(side_effect=[_Result(0), _Result(0), _Result(0)])
 
-        ok = client.send_keys("runner-blog", "/prompts:run_update DEV=x", enter=True, delay_ms=0, force_buffer=True)
+        ok = client.send_keys("runner-blog", "/prompts:run_govern DEV=x", enter=True, delay_ms=0, force_buffer=True)
 
         self.assertTrue(ok)
         self.assertEqual(client._run.call_args_list[0].args[0], "load-buffer")
@@ -114,8 +114,8 @@ class SessionMenuRunTests(unittest.TestCase):
         ) as ensure_gates, patch(
             "src.menu.inspect_runner_start_state", return_value={"ok": True}
         ), patch("src.menu.build_runner_paths", return_value=SimpleNamespace(state=object())), patch(
-            "src.menu.resolve_active_task_execution_profile",
-            return_value={"model_profile": "mini", "model": "gpt-5.4-mini", "reasoning_effort": "medium", "task_id": "TT-101"},
+            "src.menu.resolve_active_seam_execution_profile",
+            return_value={"model_profile": "mini", "model": "gpt-5.4-mini", "reasoning_effort": "medium", "seam_id": "TT-101"},
         ), patch(
             "src.menu.make_codex_exec_loop_script", return_value="echo runner"
         ), patch("src.menu.print") as print_mock:
@@ -128,7 +128,7 @@ class SessionMenuRunTests(unittest.TestCase):
         menu.tmux.create_session.assert_called_once()
         self.assertEqual(attach_name, "runner-Blog")
         print_mock.assert_any_call("  Started runner-Blog (mini, gpt-5.4-mini, effort=medium)")
-        print_mock.assert_any_call("    active task: TT-101")
+        print_mock.assert_any_call("    active seam: TT-101")
 
     def test_runner_start_attaches_first_when_multiple_projects_selected(self):
         menu = self._make_menu()
@@ -140,8 +140,8 @@ class SessionMenuRunTests(unittest.TestCase):
         ), patch(
             "src.menu.inspect_runner_start_state", return_value={"ok": True}
         ), patch("src.menu.build_runner_paths", return_value=SimpleNamespace(state=object())), patch(
-            "src.menu.resolve_active_task_execution_profile",
-            return_value={"model_profile": "high", "model": "gpt-5.4", "reasoning_effort": "high", "task_id": "TT-001"},
+            "src.menu.resolve_active_seam_execution_profile",
+            return_value={"model_profile": "high", "model": "gpt-5.4", "reasoning_effort": "high", "seam_id": "TT-001"},
         ), patch(
             "src.menu.make_codex_exec_loop_script", return_value="echo runner"
         ), patch("src.menu.print"):
@@ -194,6 +194,103 @@ class SessionMenuRunTests(unittest.TestCase):
             self.assertFalse(is_active)
             self.assertFalse(active_lock.exists())
 
+    def test_done_lock_with_zero_tasks_is_treated_as_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            done_lock = dev / "Repos" / "Blog" / ".memory" / "runner" / "locks" / "RUNNER_DONE.lock"
+            done_lock.parent.mkdir(parents=True, exist_ok=True)
+            done_lock.write_text("done\n")
+
+            tmux = Mock()
+            tmux.list_sessions.return_value = []
+            tmux.get_pane_title.return_value = None
+
+            with patch.dict(os.environ, {"DEV": str(dev)}):
+                menu = SessionMenu(tmux)
+                state = menu._project_runner_display_state("Blog", todo_count=0)
+
+            self.assertEqual(state, "done")
+
+    def test_done_lock_is_resolved_from_active_worktree_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            canonical_done_lock = dev / "Repos" / "Blog" / ".memory" / "runner" / "locks" / "RUNNER_DONE.lock"
+            canonical_done_lock.parent.mkdir(parents=True, exist_ok=True)
+            worktree_root = dev / "worktrees" / "w1" / "Blog"
+            done_lock = worktree_root / ".memory" / "runner" / "locks" / "RUNNER_DONE.lock"
+            done_lock.parent.mkdir(parents=True, exist_ok=True)
+            done_lock.write_text("done\n")
+
+            tmux = Mock()
+            tmux.list_sessions.return_value = []
+            tmux.get_pane_title.return_value = None
+
+            with patch.dict(os.environ, {"DEV": str(dev)}), patch(
+                "src.menu.resolve_target_project_root",
+                return_value=worktree_root,
+            ):
+                menu = SessionMenu(tmux)
+                state = menu._project_runner_display_state("Blog", todo_count=0)
+
+            self.assertEqual(state, "done")
+            self.assertFalse(canonical_done_lock.exists())
+
+    def test_zero_tasks_without_done_marker_is_idle_not_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            tmux = Mock()
+            tmux.list_sessions.return_value = []
+            tmux.get_pane_title.return_value = None
+
+            with patch.dict(os.environ, {"DEV": str(dev)}):
+                menu = SessionMenu(tmux)
+                state = menu._project_runner_display_state("Blog", todo_count=0)
+
+            self.assertEqual(state, "idle")
+
+    def test_done_runner_state_is_ignored_when_pending_tasks_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            state_file = dev / "Repos" / "Blog" / ".memory" / "runner" / "runtime" / "RUNNER_STATE.json"
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text('{"status":"done"}\n', encoding="utf-8")
+
+            tmux = Mock()
+            tmux.list_sessions.return_value = []
+            tmux.get_pane_title.return_value = None
+
+            with patch.dict(os.environ, {"DEV": str(dev)}):
+                menu = SessionMenu(tmux)
+                state = menu._project_runner_display_state("Blog", todo_count=2)
+
+            self.assertEqual(state, "pending")
+
+    def test_get_all_projects_counts_pending_tasks_from_resolved_worktree_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            canonical_memory = dev / "Repos" / "Blog" / ".memory"
+            canonical_memory.mkdir(parents=True, exist_ok=True)
+            worktree_root = dev / "worktrees" / "w1" / "Blog"
+            tasks_file = worktree_root / ".memory" / "runner" / "TASKS.json"
+            tasks_file.parent.mkdir(parents=True, exist_ok=True)
+            tasks_file.write_text(
+                '{"tasks":[{"task_id":"TT-1","status":"done"},{"task_id":"TT-2","status":"open"}]}\n',
+                encoding="utf-8",
+            )
+
+            tmux = Mock()
+            tmux.list_sessions.return_value = []
+            tmux.get_pane_title.return_value = None
+
+            with patch.dict(os.environ, {"DEV": str(dev)}), patch(
+                "src.menu.resolve_target_project_root",
+                return_value=worktree_root,
+            ):
+                menu = SessionMenu(tmux)
+                projects = menu._get_all_projects()
+
+            self.assertEqual(projects, [("Blog", 1)])
+
     def test_runner_start_skips_unprepared_project(self):
         menu = self._make_menu()
         menu.tmux.create_session = Mock(return_value="%1")
@@ -230,8 +327,13 @@ class SessionMenuRunTests(unittest.TestCase):
             with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev)}):
                 menu = SessionMenu(tmux)
                 with patch.object(menu, "_get_all_projects", return_value=[("Blog", 0), ("Shop", 0)]), patch.object(
-                    menu, "_active_runner_projects", return_value={"Blog"}
-                ), patch.object(menu, "_load_runner_prefs", return_value=set()), patch.object(
+                    menu,
+                    "_project_runner_display_state",
+                    side_effect=lambda name, todo_count=None, existing_sessions=None: {
+                        "Blog": "running",
+                        "Shop": "idle",
+                    }[name],
+                ), patch.object(menu, "_load_runner_pref_selection", return_value=(set(), False)), patch.object(
                     menu, "_load_runner_complexity", return_value="high"
                 ), patch("src.menu.sys.stdin.isatty", return_value=False), patch(
                     "src.menu.os.open", side_effect=OSError
@@ -255,8 +357,8 @@ class SessionMenuRunTests(unittest.TestCase):
                     return_value=[("Blog", 0), ("Shop", 0)],
                 ), patch.object(
                     menu,
-                    "_load_runner_prefs",
-                    return_value={"Blog", "Shop"},
+                    "_load_runner_pref_selection",
+                    return_value=({"Blog", "Shop"}, True),
                 ), patch.object(
                     menu,
                     "_load_runner_complexity",
@@ -289,8 +391,8 @@ class SessionMenuRunTests(unittest.TestCase):
                     return_value=[("Blog", 0), ("Shop", 0)],
                 ), patch.object(
                     menu,
-                    "_load_runner_prefs",
-                    return_value={"Blog", "Shop"},
+                    "_load_runner_pref_selection",
+                    return_value=({"Blog", "Shop"}, True),
                 ), patch.object(
                     menu,
                     "_load_runner_complexity",
@@ -364,6 +466,44 @@ class SessionMenuRunTests(unittest.TestCase):
                 self.assertEqual(menu._load_runner_complexity(), "xhigh")
                 self.assertEqual(menu._load_runner_prefs(), {"Blog"})
 
+    def test_runner_prefs_preserve_explicit_empty_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            tmux = Mock()
+            tmux.list_sessions.return_value = []
+            tmux.get_pane_title.return_value = None
+
+            with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev)}):
+                menu = SessionMenu(tmux)
+                menu._save_runner_prefs(set(), "high")
+                self.assertEqual(menu._load_runner_pref_selection(), (set(), True))
+                self.assertEqual(menu._load_runner_prefs(), set())
+
+    def test_project_selector_honors_saved_all_off_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dev = Path(tmp)
+            tmux = Mock()
+            tmux.list_sessions.return_value = []
+            tmux.get_pane_title.return_value = None
+
+            with patch.dict(os.environ, {"DEV": str(dev), "HOME": str(dev)}):
+                menu = SessionMenu(tmux)
+                menu._save_runner_prefs(set(), "high")
+                fake = _FakeScreen(keys=[27])
+                with patch.object(menu, "_get_all_projects", return_value=[("time-track", 3), ("repo", 0)]), patch.object(
+                    menu, "_project_runner_display_state", return_value="pending"
+                ), patch(
+                    "src.menu.curses.curs_set", side_effect=curses.error("unsupported")
+                ), patch(
+                    "src.menu.curses.use_default_colors", side_effect=curses.error("unsupported")
+                ):
+                    result = menu._run_project_selector(fake)
+
+            self.assertIsNone(result)
+            rendered = "\n".join(fake.lines)
+            self.assertIn("[ ] time-track", rendered)
+            self.assertIn("[ ] repo", rendered)
+
     def test_fallback_selector_persists_toggles_before_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             dev = Path(tmp)
@@ -375,7 +515,7 @@ class SessionMenuRunTests(unittest.TestCase):
                 menu = SessionMenu(tmux)
                 with patch.object(menu, "_get_all_projects", return_value=[("Banksy", 1), ("Blog", 1)]), patch.object(
                     menu, "_active_runner_projects", return_value=set()
-                ), patch.object(menu, "_load_runner_prefs", return_value=set()), patch.object(
+                ), patch.object(menu, "_load_runner_pref_selection", return_value=(set(), False)), patch.object(
                     menu, "_load_runner_complexity", return_value="high"
                 ), patch("src.menu.sys.stdin.isatty", return_value=False), patch(
                     "src.menu.os.open", side_effect=OSError
@@ -478,7 +618,7 @@ class SessionMenuUiTests(unittest.TestCase):
         menu = self._menu()
         fake = _FakeScreen(height=8, width=24, keys=[27])
         with patch.object(menu, "_get_all_projects", return_value=[("time-track", 3), ("repo", 0)]), patch.object(
-            menu, "_load_runner_prefs", return_value={"time-track"}
+            menu, "_load_runner_pref_selection", return_value=({"time-track"}, True)
         ), patch.object(menu, "_load_runner_complexity", return_value="high"), patch.object(
             menu, "_active_runner_projects", return_value=set()
         ), patch("src.menu.curses.curs_set", side_effect=curses.error("unsupported")), patch(
@@ -492,7 +632,7 @@ class SessionMenuUiTests(unittest.TestCase):
         menu = self._menu()
         fake = _FakeScreen(keys=[ord("a"), 27])
         with patch.object(menu, "_get_all_projects", return_value=[("time-track", 3), ("repo", 0)]), patch.object(
-            menu, "_load_runner_prefs", return_value={"time-track", "repo"}
+            menu, "_load_runner_pref_selection", return_value=({"time-track", "repo"}, True)
         ), patch.object(menu, "_load_runner_complexity", return_value="high"), patch.object(
             menu, "_active_runner_projects", return_value=set()
         ), patch.object(menu, "_persist_runner_picker_state") as persist_state, patch(
@@ -504,6 +644,71 @@ class SessionMenuUiTests(unittest.TestCase):
 
         self.assertIsNone(result)
         persist_state.assert_called_once_with(set(), "high")
+
+    def test_project_selector_marks_completed_projects_done_and_uses_neutral_help_when_idle(self):
+        menu = self._menu()
+        fake = _FakeScreen(keys=[27])
+        with patch.object(menu, "_get_all_projects", return_value=[("time-track", 0), ("repo", 1)]), patch.object(
+            menu, "_load_runner_pref_selection", return_value=({"time-track"}, True)
+        ), patch.object(menu, "_load_runner_complexity", return_value="high"), patch.object(
+            menu,
+            "_project_runner_display_state",
+            side_effect=lambda name, todo_count=None, existing_sessions=None: {
+                "time-track": "done",
+                "repo": "pending",
+            }[name],
+        ), patch(
+            "src.menu.curses.curs_set", side_effect=curses.error("unsupported")
+        ), patch(
+            "src.menu.curses.use_default_colors", side_effect=curses.error("unsupported")
+        ):
+            result = menu._run_project_selector(fake)
+
+        self.assertIsNone(result)
+        rendered = "\n".join(fake.lines)
+        self.assertIn("(0 tasks) [done]", rendered)
+        self.assertNotIn("(0 tasks) [running]", rendered)
+        self.assertNotIn("locked=running", rendered)
+        self.assertNotIn("running projects locked", rendered)
+
+    def test_project_selector_help_mentions_locking_only_when_projects_are_running(self):
+        menu = self._menu()
+        fake = _FakeScreen(keys=[27])
+        with patch.object(menu, "_get_all_projects", return_value=[("time-track", 0), ("repo", 1)]), patch.object(
+            menu, "_load_runner_pref_selection", return_value=({"time-track"}, True)
+        ), patch.object(menu, "_load_runner_complexity", return_value="high"), patch.object(
+            menu,
+            "_project_runner_display_state",
+            side_effect=lambda name, todo_count=None, existing_sessions=None: {
+                "time-track": "running",
+                "repo": "pending",
+            }[name],
+        ), patch(
+            "src.menu.curses.curs_set", side_effect=curses.error("unsupported")
+        ), patch(
+            "src.menu.curses.use_default_colors", side_effect=curses.error("unsupported")
+        ):
+            result = menu._run_project_selector(fake)
+
+        self.assertIsNone(result)
+        rendered = "\n".join(fake.lines)
+        self.assertIn("(running projects locked)", rendered)
+
+    def test_completed_project_remains_selectable_in_project_selector(self):
+        menu = self._menu()
+        fake = _FakeScreen(keys=[10])
+        with patch.object(menu, "_get_all_projects", return_value=[("time-track", 0)]), patch.object(
+            menu, "_load_runner_pref_selection", return_value=({"time-track"}, True)
+        ), patch.object(menu, "_load_runner_complexity", return_value="high"), patch.object(
+            menu, "_project_runner_display_state", return_value="done"
+        ), patch(
+            "src.menu.curses.curs_set", side_effect=curses.error("unsupported")
+        ), patch(
+            "src.menu.curses.use_default_colors", side_effect=curses.error("unsupported")
+        ):
+            result = menu._run_project_selector(fake)
+
+        self.assertEqual(result, (["time-track"], "high"))
 
 
 if __name__ == "__main__":

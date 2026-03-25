@@ -7,9 +7,11 @@ import re
 import shlex
 import sys
 import time
+import json
 from pathlib import Path
 
 from .menu import SessionMenu
+from .runner_graph import run_runner_build_graph_command
 from .runctl import ensure_runner_prompt_install, inspect_runner_start_state, resolve_target_project_root
 from .runner_loop import (
     build_runner_paths,
@@ -21,7 +23,7 @@ from .runner_loop import (
     run_loop_worker,
     run_runner_profile,
 )
-from .runner_state import coerce_runner_phase, read_json
+from .runner_state import build_runner_state_paths_for_root, coerce_runner_phase, read_json
 from .tmux import TmuxClient
 
 
@@ -50,6 +52,7 @@ def detect_session_type(args: list[str]) -> tuple[str, str]:
         "/run" in normalized_args
         or "/prompts:run_setup" in normalized_args
         or "/prompts:run_execute" in normalized_args
+        or "/prompts:run_govern" in normalized_args
     ):
         return "run", "run worker"
     args_str = " ".join(normalized_args)
@@ -521,6 +524,69 @@ def main() -> None:
         raise SystemExit(run_runner_profile(args[1:]))
     if args and args[0] == "__runner-archive":
         raise SystemExit(run_runner_archive(args[1:]))
+    if args and args[0] == "__runner-build-graph":
+        if len(args) < 2:
+            raise SystemExit("Usage: __runner-build-graph --project-root <root> [--runner-id main]")
+        project_root: Path | None = None
+        runner_id = "main"
+        idx = 1
+        while idx < len(args):
+            arg = args[idx]
+            if arg == "--project-root":
+                idx += 1
+                if idx >= len(args):
+                    raise SystemExit("Missing value for --project-root")
+                project_root = Path(args[idx]).expanduser().resolve()
+            elif arg.startswith("--project-root="):
+                project_root = Path(arg.split("=", 1)[1]).expanduser().resolve()
+            elif arg == "--runner-id":
+                idx += 1
+                if idx >= len(args):
+                    raise SystemExit("Missing value for --runner-id")
+                runner_id = args[idx]
+            elif arg.startswith("--runner-id="):
+                runner_id = arg.split("=", 1)[1]
+            else:
+                raise SystemExit(f"Unknown option: {arg}")
+            idx += 1
+        if project_root is None:
+            raise SystemExit("Missing --project-root")
+        dev = os.environ.get("DEV", "/Users/jian/Dev")
+        paths = build_runner_state_paths_for_root(
+            project_root=project_root,
+            dev=dev,
+            project=project_root.name,
+            runner_id=runner_id or "main",
+        )
+        seams_payload = read_json(paths.seams_json) or {}
+        state = read_json(paths.state_file) or {}
+        selected_task_id = str(state.get("active_seam_id") or state.get("next_task_id") or "").strip()
+        selected_task = None
+        for index, raw in enumerate(seams_payload.get("seams", [])):
+            if isinstance(raw, dict) and str(raw.get("seam_id") or "").strip() == selected_task_id:
+                selected_task = {
+                    "task_id": str(raw.get("seam_id") or "").strip(),
+                    "title": str(raw.get("title") or raw.get("owner_problem") or "").strip(),
+                    "status": str(raw.get("status") or "").strip(),
+                    "touch_paths": raw.get("touch_paths") or raw.get("write_set") or [],
+                    "coupling_notes": raw.get("coupling_notes") or [],
+                    "fanout_risk": raw.get("fanout_risk"),
+                    "model_profile": raw.get("model_profile"),
+                    "deprecation_phase": raw.get("deprecation_phase"),
+                    "priority": raw.get("priority") or "p1",
+                    "updated_at": raw.get("updated_at"),
+                }
+                break
+        print(
+            json.dumps(
+                run_runner_build_graph_command(
+                    project_root=project_root,
+                    paths=paths,
+                    selected_task=selected_task,
+                )
+            )
+        )
+        raise SystemExit(0)
     if args and args[0] == "__runner-controller":
         raise SystemExit(run_interactive_runner_controller(args[1:]))
 

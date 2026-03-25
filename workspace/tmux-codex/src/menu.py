@@ -33,7 +33,7 @@ import termios
 import time
 import tty
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from .tmux import TmuxClient
@@ -42,7 +42,7 @@ from .runner_loop import (
     build_runner_paths,
     ensure_gates_file,
     make_codex_exec_loop_script,
-    resolve_active_task_execution_profile,
+    resolve_active_seam_execution_profile,
     resolve_runner_profile,
 )
 from .runner_status import detect_runner_state
@@ -50,6 +50,8 @@ from .runctl import inspect_runner_start_state, resolve_target_project_root
 from .runner_state import read_json
 from .runner_state import codex_home
 from .tmux import LINES_STATUS
+
+RunnerProjectState = Literal["running", "done", "pending", "idle"]
 
 
 def _delete_word(text: str) -> str:
@@ -71,6 +73,7 @@ class SessionMenu:
         self.pane_titles: list[str | None] = []
         self._poll_count = 0  # Increments each poll for spinner
         self._tags_cache: dict[str, str] | None = None  # Cleared each draw cycle
+
     @property
     def _dev_path(self) -> Path:
         """Get DEV path (cached)."""
@@ -103,11 +106,20 @@ class SessionMenu:
 
     def _load_runner_prefs(self) -> set[str]:
         """Load enabled projects from prefs file."""
+        enabled, _has_saved_selection = self._load_runner_pref_selection()
+        return enabled
+
+    def _load_runner_pref_selection(self) -> tuple[set[str], bool]:
+        """Load enabled projects and whether a saved selection exists.
+
+        An empty saved selection must remain distinct from "no preferences saved yet"
+        so the project picker can preserve an intentional all-off state.
+        """
         data = self._load_runner_prefs_data()
-        enabled = data.get("enabled_projects", [])
+        enabled = data.get("enabled_projects")
         if isinstance(enabled, list):
-            return {str(item) for item in enabled}
-        return set()
+            return ({str(item) for item in enabled}, True)
+        return (set(), False)
 
     def _load_runner_complexity(self) -> str:
         """Load persisted runner complexity preference."""
@@ -188,39 +200,89 @@ class SessionMenu:
         if repos_dir.exists():
             for folder in sorted(repos_dir.iterdir()):
                 if folder.is_dir() and not folder.name.startswith('.'):
-                    memory_dir = folder / ".memory"
-                    if memory_dir.exists():
+                    project_root = self._runner_project_root_for_project(folder.name)
+                    memory_dir = project_root / ".memory"
+                    if memory_dir.exists() or (folder / ".memory").exists():
                         todo_count = self._count_pending_tasks_for_memory_dir(memory_dir)
                         projects.append((folder.name, todo_count))
 
         return projects
 
+    def _runner_project_root_for_project(self, project: str) -> Path:
+        try:
+            return resolve_target_project_root(
+                dev=str(self._dev_path),
+                project=project,
+                runner_id="main",
+            )
+        except Exception:
+            return self._dev_path / "Repos" / project
+
     def _runner_session_name_for_project(self, project: str) -> str:
         return f"runner-{project}"
 
-    def _runner_active_lock_for_project(self, project: str) -> Path:
-        return self._dev_path / "Repos" / project / ".memory" / "runner" / "locks" / "RUNNER_ACTIVE.lock"
+    def _runner_memory_dir_for_project(self, project: str) -> Path:
+        return self._runner_project_root_for_project(project) / ".memory"
 
-    def _project_has_running_runner(self, project: str, existing_sessions: set[str] | None = None) -> bool:
+    def _runner_active_lock_for_project(self, project: str) -> Path:
+        return self._runner_memory_dir_for_project(project) / "runner" / "locks" / "RUNNER_ACTIVE.lock"
+
+    def _runner_done_lock_for_project(self, project: str) -> Path:
+        return self._runner_memory_dir_for_project(project) / "runner" / "locks" / "RUNNER_DONE.lock"
+
+    def _runner_state_file_for_project(self, project: str) -> Path:
+        return self._runner_memory_dir_for_project(project) / "runner" / "runtime" / "RUNNER_STATE.json"
+
+    def _project_runner_display_state(
+        self,
+        project: str,
+        todo_count: int | None = None,
+        existing_sessions: set[str] | None = None,
+    ) -> RunnerProjectState:
         session_name = self._runner_session_name_for_project(project)
         sessions = existing_sessions if existing_sessions is not None else set(self.tmux.list_sessions())
         active_lock = self._runner_active_lock_for_project(project)
 
         if session_name in sessions:
             status = self._get_runner_status(session_name)
-            # Active thinking/background work counts as in-progress.
             if status in {"🔄", "💤"}:
-                return True
+                return "running"
             if active_lock.exists():
                 # Lock exists but pane is idle/shell/done: unblock and recover.
                 active_lock.unlink(missing_ok=True)
-            return False
-
-        if active_lock.exists():
+        elif active_lock.exists():
             # Session is gone; remove stale lock to unblock future starts.
             active_lock.unlink(missing_ok=True)
-            return False
-        return False
+
+        pending_count = todo_count
+        if pending_count is None:
+            pending_count = self._count_pending_tasks_for_memory_dir(self._runner_memory_dir_for_project(project))
+        if pending_count > 0:
+            return "pending"
+
+        runner_state = read_json(self._runner_state_file_for_project(project)) or {}
+        runner_status = str(runner_state.get("status", "")).strip().lower()
+        if self._runner_done_lock_for_project(project).exists() or runner_status == "done":
+            return "done"
+
+        return "idle"
+
+    def _runner_picker_help_text(self, *, has_running_projects: bool, escape_key: str) -> str:
+        base = f"Space=toggle | a=all/none | n=none | Enter=start | {escape_key}=cancel"
+        if has_running_projects:
+            return f"{base} (running projects locked)"
+        return base
+
+    def _runner_picker_count_text(self, *, todo_count: int, state: RunnerProjectState) -> str:
+        count_text = f"({todo_count} tasks)" if todo_count > 0 else "(0 tasks)"
+        if state == "running":
+            return f"{count_text} [running]"
+        if state == "done":
+            return f"{count_text} [done]"
+        return count_text
+
+    def _project_has_running_runner(self, project: str, existing_sessions: set[str] | None = None) -> bool:
+        return self._project_runner_display_state(project, existing_sessions=existing_sessions) == "running"
 
     def _active_runner_projects(self, projects: list[str]) -> set[str]:
         sessions = set(self.tmux.list_sessions())
@@ -403,7 +465,7 @@ class SessionMenu:
             return "✓"
         if sess_name.startswith("runner-"):
             project = sess_name.replace("runner-", "", 1)
-            done_lock = self._dev_path / "Repos" / project / ".memory" / "runner" / "locks" / "RUNNER_DONE.lock"
+            done_lock = self._runner_done_lock_for_project(project)
             if done_lock.exists():
                 return "✓"
 
@@ -442,35 +504,28 @@ class SessionMenu:
         return title
 
     def _count_todo_tasks(self) -> int:
-        """Count pending TASKS.json items across all projects."""
-        repos_dir = self._dev_path / "Repos"
-        count = 0
-        if repos_dir.exists():
-            for tasks_file in repos_dir.glob("*/.memory/runner/TASKS.json"):
-                try:
-                    payload = json.loads(tasks_file.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    continue
-                tasks = payload.get("tasks")
-                if not isinstance(tasks, list):
-                    continue
-                for raw in tasks:
-                    if not isinstance(raw, dict):
-                        continue
-                    status = str(raw.get("status", "")).strip().lower()
-                    if status in {"open", "in_progress", "blocked"}:
-                        count += 1
-        return count
+        """Count pending runner seams across all projects."""
+        return sum(todo_count for _, todo_count in self._get_all_projects())
 
     def _count_pending_tasks_for_memory_dir(self, memory_dir: Path) -> int:
-        tasks_file = memory_dir / "runner" / "TASKS.json"
-        if not tasks_file.exists():
-            return 0
-        try:
-            payload = json.loads(tasks_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return 0
-        tasks = payload.get("tasks")
+        seams_file = memory_dir / "runner" / "SEAMS.json"
+        payload = None
+        if seams_file.exists():
+            try:
+                payload = json.loads(seams_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = None
+        if not isinstance(payload, dict):
+            tasks_file = memory_dir / "runner" / "TASKS.json"
+            if not tasks_file.exists():
+                return 0
+            try:
+                payload = json.loads(tasks_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return 0
+            tasks = payload.get("tasks")
+        else:
+            tasks = payload.get("seams")
         if not isinstance(tasks, list):
             return 0
         pending = 0
@@ -745,11 +800,11 @@ class SessionMenu:
             return None
 
         # Load saved preferences
-        saved_prefs = self._load_runner_prefs()
+        saved_prefs, has_saved_selection = self._load_runner_pref_selection()
         # Initialize enabled state - use saved prefs, or all enabled if no prefs
         enabled = set()
         for name, _ in projects:
-            if saved_prefs:
+            if has_saved_selection:
                 if name in saved_prefs:
                     enabled.add(name)
             else:
@@ -764,7 +819,12 @@ class SessionMenu:
         while True:
             stdscr.clear()
             row = 1
-            active_projects = self._active_runner_projects(project_names)
+            sessions = set(self.tmux.list_sessions())
+            project_states = {
+                name: self._project_runner_display_state(name, todo_count=todo_count, existing_sessions=sessions)
+                for name, todo_count in projects
+            }
+            active_projects = {name for name, state in project_states.items() if state == "running"}
             enabled = {name for name in enabled if name not in active_projects}
 
             self._safe_addstr(stdscr, row, 2, "Start Runners - Select Projects", curses.A_BOLD)
@@ -772,7 +832,8 @@ class SessionMenu:
 
             # Draw project list with checkboxes
             for idx, (name, todo_count) in enumerate(projects):
-                is_active = name in active_projects
+                state = project_states[name]
+                is_active = state == "running"
                 # Checkbox
                 checkbox = "[~]" if is_active else ("[x]" if name in enabled else "[ ]")
                 # Highlight current row
@@ -780,9 +841,7 @@ class SessionMenu:
                 if is_active:
                     attr |= curses.A_DIM
                 # Task count suffix
-                count_str = f"({todo_count} tasks)" if todo_count > 0 else "(0 tasks)"
-                if is_active:
-                    count_str += " [running]"
+                count_str = self._runner_picker_count_text(todo_count=todo_count, state=state)
                 # Number prefix (1-9)
                 num = str(idx + 1) if idx < 9 else " "
 
@@ -796,7 +855,10 @@ class SessionMenu:
                 stdscr,
                 row,
                 2,
-                "Space=toggle | a=all/none | n=none | Enter=start | Esc=cancel (locked=running)",
+                self._runner_picker_help_text(
+                    has_running_projects=bool(active_projects),
+                    escape_key="Esc",
+                ),
                 curses.A_DIM,
             )
 
@@ -858,10 +920,10 @@ class SessionMenu:
             print("\n  No projects found in Repos/")
             return None
 
-        saved_prefs = self._load_runner_prefs()
+        saved_prefs, has_saved_selection = self._load_runner_pref_selection()
         enabled = set()
         for name, _ in projects:
-            if saved_prefs:
+            if has_saved_selection:
                 if name in saved_prefs:
                     enabled.add(name)
             else:
@@ -874,18 +936,28 @@ class SessionMenu:
         cursor = 0
 
         while True:
-            active_projects = self._active_runner_projects(project_names)
+            sessions = set(self.tmux.list_sessions())
+            project_states = {
+                name: self._project_runner_display_state(name, todo_count=todo_count, existing_sessions=sessions)
+                for name, todo_count in projects
+            }
+            active_projects = {name for name, state in project_states.items() if state == "running"}
             enabled = {name for name in enabled if name not in active_projects}
             for idx, (name, todo_count) in enumerate(projects):
-                is_active = name in active_projects
+                state = project_states[name]
+                is_active = state == "running"
                 checkbox = "[~]" if is_active else ("[x]" if name in enabled else "[ ]")
-                count_str = f"({todo_count} tasks)" if todo_count > 0 else "(0 tasks)"
-                if is_active:
-                    count_str += " [running]"
+                count_str = self._runner_picker_count_text(todo_count=todo_count, state=state)
                 marker = ">" if idx == cursor else " "
                 print(f"{marker} {idx + 1}) {checkbox} {name:<20} {count_str}")
 
-            print("\n  ↑/↓ move | Space=toggle | a=all/none | n=none | Enter=start | q=cancel (locked=running)")
+            print(
+                "\n  "
+                + self._runner_picker_help_text(
+                    has_running_projects=bool(active_projects),
+                    escape_key="q",
+                )
+            )
 
             try:
                 choice = self._read_fallback_project_selector_input()
@@ -1043,7 +1115,7 @@ class SessionMenu:
                 runner_id=runner_id,
                 project_root=project_root,
             )
-            active_profile = resolve_active_task_execution_profile(
+            active_profile = resolve_active_seam_execution_profile(
                 paths=paths.state,
                 fallback_model=model,
                 fallback_reasoning_effort=reasoning_effort,
@@ -1066,10 +1138,10 @@ class SessionMenu:
             display_profile = str(active_profile.get("model_profile") or complexity)
             display_model = str(active_profile.get("model") or model)
             display_effort = str(active_profile.get("reasoning_effort") or reasoning_effort)
-            display_task_id = str(active_profile.get("task_id") or "").strip()
+            display_seam_id = str(active_profile.get("seam_id") or active_profile.get("task_id") or "").strip()
             print(f"  Started {sess_name} ({display_profile}, {display_model}, effort={display_effort})")
-            if display_task_id:
-                print(f"    active task: {display_task_id}")
+            if display_seam_id:
+                print(f"    active seam: {display_seam_id}")
             state_paths = getattr(paths, "state", None)
             state_file_path = getattr(state_paths, "state_file", None)
             state_data = read_json(state_file_path) if state_file_path is not None else {}

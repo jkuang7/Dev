@@ -21,6 +21,9 @@ Applies to everything under `/Users/jian/Dev` unless a deeper `AGENTS.md` overri
 - Load `<project-root>/.memory/lessons.md` if present.
 - Only create `.memory/lessons.md` for projects rooted under `/Users/jian/Dev/Repos/<project>*`.
 - If the repo defines an LLM or harness contract, follow that loading order exactly.
+- If runner graph artifacts exist, use them as the first structural hint before broad repo scanning.
+- Keep full dependency graphs out of normal execution slices; use compact active-slice graph context for execute and reserve full graph reasoning for planning/reseeding.
+- Reuse an already-running app or browser instance before launching a new one when the existing instance is suitable for the task.
 
 ## Default Definition Of Done
 
@@ -72,7 +75,6 @@ Rules:
 
 - No behavior change unless requested.
 - Use git history when needed to avoid known failure modes.
-- Slice work and verify each slice.
 
 ## React Design
 

@@ -14,9 +14,10 @@ from typing import Any
 
 DEFAULT_IMPLEMENTATION_PLAN = [
     "Confirm scope and constraints for the current objective.",
-    "Execute one task from TASKS.json with validation evidence.",
+    "Execute one active seam with validation evidence.",
     "Run run_gates and only mark done when all checks pass.",
 ]
+DONE_NEXT_TASK_TEXT = "No open seams remain in SEAMS.json."
 RUNNER_PHASES = ("discover", "implement", "verify", "closeout")
 DEFAULT_PHASE_BUDGET_MINUTES = 45
 
@@ -59,10 +60,19 @@ class RunnerStatePaths:
     enable_pending: Path
     clear_pending: Path
     hooks_log: Path
+    objective_json: Path
+    seams_json: Path
+    gaps_json: Path
     prd_json: Path
     tasks_json: Path
+    runner_parity_json: Path
     exec_context_json: Path
     active_backlog_json: Path
+    graph_dir: Path
+    dep_graph_json: Path
+    graph_active_slice_json: Path
+    graph_boundaries_json: Path
+    graph_hotspots_json: Path
     cycle_prepared_file: Path
     task_intake_file: Path
     runner_log: Path
@@ -98,6 +108,7 @@ def build_runner_state_paths_for_root(
     runner_dir = memory_dir / "runner"
     runner_runtime_dir = runner_dir / "runtime"
     runner_locks_dir = runner_dir / "locks"
+    graph_dir = runner_dir / "graph"
     logs_dir = codex_home(dev) / "logs" / "runners"
 
     return RunnerStatePaths(
@@ -117,10 +128,19 @@ def build_runner_state_paths_for_root(
         enable_pending=runner_locks_dir / "RUNNER_ENABLE.pending.json",
         clear_pending=runner_locks_dir / "RUNNER_CLEAR.pending.json",
         hooks_log=runner_runtime_dir / "RUNNER_HOOKS.ndjson",
+        objective_json=runner_dir / "OBJECTIVE.json",
+        seams_json=runner_dir / "SEAMS.json",
+        gaps_json=runner_dir / "GAPS.json",
         prd_json=runner_dir / "PRD.json",
         tasks_json=runner_dir / "TASKS.json",
+        runner_parity_json=runner_dir / "RUNNER_PARITY.json",
         exec_context_json=runner_dir / "RUNNER_EXEC_CONTEXT.json",
         active_backlog_json=runner_dir / "RUNNER_ACTIVE_BACKLOG.json",
+        graph_dir=graph_dir,
+        dep_graph_json=graph_dir / "RUNNER_DEP_GRAPH.json",
+        graph_active_slice_json=graph_dir / "RUNNER_GRAPH_ACTIVE_SLICE.json",
+        graph_boundaries_json=graph_dir / "RUNNER_GRAPH_BOUNDARIES.json",
+        graph_hotspots_json=graph_dir / "RUNNER_GRAPH_HOTSPOTS.json",
         cycle_prepared_file=runner_runtime_dir / "RUNNER_CYCLE_PREPARED.json",
         task_intake_file=runner_dir / "RUNNER_TASK_INTAKE.json",
         runner_log=logs_dir / f"runner-{project}.log",
@@ -141,14 +161,20 @@ def default_runner_state(project: str, runner_id: str) -> dict[str, Any]:
         "current_step": "",
         "last_hil_decision": None,
         "dod_status": "in_progress",
-        "current_goal": "Establish the active objective and execute the next concrete validated slice.",
+        "current_goal": "Seed a concrete objective from the latest user request and repo evidence.",
         "last_iteration_summary": "",
         "completed_recent": [],
-        "next_task": "Execute the first concrete validated slice toward the active objective.",
+        "next_seam": "Seed the first concrete seam slice from the active objective.",
+        "next_seam_reason": "No prior iteration update exists yet.",
+        "next_task": "Seed the first concrete task slice from the active objective.",
         "next_task_reason": "No prior iteration update exists yet.",
         "objective_id": None,
+        "active_seam_id": None,
+        "next_seam_id": None,
         "next_task_id": None,
+        "current_seam_id": None,
         "current_task_id": None,
+        "seam_selection_reason": None,
         "task_selection_reason": None,
         "state_revision": 0,
         "project_root": None,
@@ -186,6 +212,7 @@ def ensure_memory_dir(paths: RunnerStatePaths) -> None:
     paths.runner_dir.mkdir(parents=True, exist_ok=True)
     paths.runner_runtime_dir.mkdir(parents=True, exist_ok=True)
     paths.runner_locks_dir.mkdir(parents=True, exist_ok=True)
+    paths.graph_dir.mkdir(parents=True, exist_ok=True)
     paths.runner_log.parent.mkdir(parents=True, exist_ok=True)
     _migrate_legacy_runner_layout(paths)
 
@@ -260,6 +287,28 @@ def _coerce_plan_list(value: Any) -> list[str]:
     return list(DEFAULT_IMPLEMENTATION_PLAN)
 
 
+def _normalize_completion_fields(normalized: dict[str, Any]) -> None:
+    status = str(normalized.get("status", "")).strip().lower()
+    normalized["status"] = status or str(normalized.get("status", "")).strip() or "init"
+
+    if status == "done":
+        normalized["current_phase"] = "closeout"
+        normalized["phase_status"] = "handoff_ready"
+        normalized["done_gate_status"] = "passed"
+        normalized["done_candidate"] = True
+        normalized["dod_status"] = "done"
+        normalized["blockers"] = []
+        normalized["next_seam_id"] = None
+        normalized["next_task_id"] = None
+        normalized["next_seam"] = DONE_NEXT_TASK_TEXT
+        normalized["next_task"] = DONE_NEXT_TASK_TEXT
+        normalized["next_seam_reason"] = DONE_NEXT_TASK_TEXT
+        normalized["next_task_reason"] = DONE_NEXT_TASK_TEXT
+        return
+
+    normalized["dod_status"] = "in_progress"
+
+
 def normalize_runner_state(
     state: dict[str, Any],
     project: str,
@@ -286,14 +335,67 @@ def normalize_runner_state(
     normalized["last_iteration_summary"] = str(
         normalized.get("last_iteration_summary", defaults["last_iteration_summary"])
     ).strip()
-    normalized["next_task"] = str(normalized.get("next_task", defaults["next_task"])).strip() or defaults["next_task"]
-    normalized["next_task_reason"] = str(
-        normalized.get("next_task_reason", defaults["next_task_reason"])
-    ).strip() or defaults["next_task_reason"]
+    raw_active_seam_id = str(state.get("active_seam_id", "")).strip() if "active_seam_id" in state else ""
+    raw_next_seam_id = str(state.get("next_seam_id", "")).strip() if "next_seam_id" in state else ""
+    raw_next_task_id = str(state.get("next_task_id", "")).strip() if "next_task_id" in state else ""
+    raw_next_seam = str(state.get("next_seam", "")).strip() if "next_seam" in state else ""
+    raw_next_task = str(state.get("next_task", "")).strip() if "next_task" in state else ""
+    raw_next_seam_reason = str(state.get("next_seam_reason", "")).strip() if "next_seam_reason" in state else ""
+    raw_next_task_reason = str(state.get("next_task_reason", "")).strip() if "next_task_reason" in state else ""
+    prefer_legacy_next_task_id = bool(raw_next_task_id) and (
+        not raw_next_seam_id
+        or raw_next_seam_id == raw_active_seam_id
+    )
+    prefer_legacy_next_task = bool(raw_next_task) and (
+        prefer_legacy_next_task_id
+        or not raw_next_seam
+        or raw_next_seam == defaults["next_seam"]
+    )
+    prefer_legacy_next_task_reason = bool(raw_next_task_reason) and (
+        prefer_legacy_next_task_id
+        or not raw_next_seam_reason
+        or raw_next_seam_reason == defaults["next_seam_reason"]
+    )
+    next_seam = str(
+        raw_next_task if prefer_legacy_next_task else (raw_next_seam or raw_next_task or defaults["next_seam"])
+    ).strip() or defaults["next_seam"]
+    next_seam_reason = str(
+        raw_next_task_reason
+        if prefer_legacy_next_task_reason
+        else (raw_next_seam_reason or raw_next_task_reason or defaults["next_seam_reason"])
+    ).strip() or defaults["next_seam_reason"]
+    normalized["next_seam"] = next_seam
+    normalized["next_task"] = next_seam
+    normalized["next_seam_reason"] = next_seam_reason
+    normalized["next_task_reason"] = next_seam_reason
 
-    for field in ("objective_id", "next_task_id", "current_task_id", "task_selection_reason"):
+    for field in (
+        "objective_id",
+        "active_seam_id",
+        "next_seam_id",
+        "next_task_id",
+        "current_seam_id",
+        "current_task_id",
+        "seam_selection_reason",
+        "task_selection_reason",
+    ):
         value = normalized.get(field)
         normalized[field] = str(value).strip() if isinstance(value, str) and str(value).strip() else None
+
+    normalized["next_seam_id"] = (
+        raw_next_task_id
+        if prefer_legacy_next_task_id
+        else (normalized.get("next_seam_id") or normalized.get("next_task_id"))
+    )
+    normalized["next_task_id"] = normalized.get("next_seam_id")
+    normalized["current_seam_id"] = (
+        normalized.get("current_seam_id")
+        or normalized.get("active_seam_id")
+        or normalized.get("current_task_id")
+    )
+    normalized["current_task_id"] = normalized.get("current_seam_id")
+    normalized["seam_selection_reason"] = normalized.get("seam_selection_reason") or normalized.get("task_selection_reason")
+    normalized["task_selection_reason"] = normalized.get("seam_selection_reason")
 
     root = normalized.get("project_root")
     normalized["project_root"] = str(root).strip() if isinstance(root, str) and str(root).strip() else None
@@ -340,6 +442,7 @@ def normalize_runner_state(
     if done_gate_status not in {"pending", "passed", "failed"}:
         done_gate_status = "pending"
     normalized["done_gate_status"] = done_gate_status
+    _normalize_completion_fields(normalized)
 
     runtime_policy = normalized.get("runtime_policy")
     if not isinstance(runtime_policy, dict):
@@ -382,6 +485,15 @@ def load_or_init_state(paths: RunnerStatePaths, project: str, runner_id: str) ->
     return normalized
 
 
+def load_state_snapshot(paths: RunnerStatePaths, project: str, runner_id: str) -> dict[str, Any]:
+    """Load normalized state without persisting compatibility backfills."""
+    state = read_json(paths.state_file)
+    if state is None:
+        return default_runner_state(project=project, runner_id=runner_id)
+    normalized, _ = normalize_runner_state(state, project=project, runner_id=runner_id)
+    return normalized
+
+
 def managed_runner_files(paths: RunnerStatePaths) -> list[Path]:
     """Enumerate managed files for clear operations."""
     files = [
@@ -396,10 +508,18 @@ def managed_runner_files(paths: RunnerStatePaths) -> list[Path]:
         paths.enable_pending,
         paths.clear_pending,
         paths.hooks_log,
+        paths.objective_json,
+        paths.seams_json,
+        paths.gaps_json,
         paths.prd_json,
         paths.tasks_json,
+        paths.runner_parity_json,
         paths.exec_context_json,
         paths.active_backlog_json,
+        paths.dep_graph_json,
+        paths.graph_active_slice_json,
+        paths.graph_boundaries_json,
+        paths.graph_hotspots_json,
         paths.cycle_prepared_file,
         paths.task_intake_file,
     ]
@@ -504,6 +624,23 @@ def count_open_tasks(tasks_payload: dict[str, Any] | None) -> int:
         return 0
     open_count = 0
     for raw in tasks:
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("status", "")).strip().lower()
+        if status in {"open", "in_progress", "blocked"}:
+            open_count += 1
+    return open_count
+
+
+def count_open_seams(seams_payload: dict[str, Any] | None) -> int:
+    """Count seams that are not done from SEAMS.json payload."""
+    if not isinstance(seams_payload, dict):
+        return 0
+    seams = seams_payload.get("seams")
+    if not isinstance(seams, list):
+        return 0
+    open_count = 0
+    for raw in seams:
         if not isinstance(raw, dict):
             continue
         status = str(raw.get("status", "")).strip().lower()

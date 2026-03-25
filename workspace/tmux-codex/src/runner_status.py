@@ -17,6 +17,13 @@ _WORKING_MARKERS = (
     "background task",
     "background tasks",
 )
+_STARTUP_MARKERS = (
+    "mcp startup",
+    "mcp startup interrupted",
+    "not initialized:",
+    "initializing mcp",
+    "loading mcp",
+)
 _SLEEPING_MARKERS = (
     "backing off",
     "restarting runner",
@@ -110,6 +117,7 @@ def detect_runner_state(
     lines = _normalize_lines(output or "")
     has_prompt = _has_prompt(lines)
     is_working = _contains_marker_recent(lines, _WORKING_MARKERS)
+    is_starting = _contains_marker_recent(lines, _STARTUP_MARKERS)
     is_sleeping = _contains_marker_recent(lines, _SLEEPING_MARKERS)
     low_activity = _low_activity(last_activity_ts)
 
@@ -117,6 +125,8 @@ def detect_runner_state(
     codex_running = is_codex_runtime_process(process_name, output or "")
 
     if is_working:
+        return "working"
+    if is_starting:
         return "working"
     if is_sleeping:
         return "sleeping"

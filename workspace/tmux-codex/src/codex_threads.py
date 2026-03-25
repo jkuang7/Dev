@@ -10,9 +10,9 @@ from typing import Any
 
 RUNNER_THREAD_PREVIEW_MARKERS = (
     "Use this command to execute exactly one medium bounded infinite-runner work slice.",
-    "Use this command to refresh infinite-runner state after one execute slice finishes.",
+    "Use this command to govern infinite-runner state after one execute slice finishes.",
     "/prompts:run_execute",
-    "/prompts:run_update",
+    "/prompts:run_govern",
 )
 
 

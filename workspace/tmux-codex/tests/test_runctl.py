@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.runctl import RUNNER_PROMPT_NAMES, clear_runner_state, create_runner_state, inspect_runner_start_state, parse_args, run
+from src.runner_graph import _load_graph_config
 from src.runner_state import build_runner_state_paths, build_runner_state_paths_for_root, compute_worktree_fingerprint, read_json, write_json
 
 
@@ -41,6 +42,12 @@ class RunctlTests(unittest.TestCase):
         }
         write_json(paths.tasks_json, payload)
 
+    def _write_context_pack(self, payload: dict) -> None:
+        project_root = self.dev / "Repos" / "blog"
+        codex_dir = project_root / ".codex"
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        write_json(codex_dir / "context-pack.json", payload)
+
     def test_setup_creates_canonical_files_and_removes_legacy_views(self):
         paths = self._paths()
         paths.memory_dir.mkdir(parents=True, exist_ok=True)
@@ -57,13 +64,21 @@ class RunctlTests(unittest.TestCase):
         self.assertTrue(created["ok"])
 
         self.assertTrue(paths.state_file.exists())
+        self.assertTrue(paths.objective_json.exists())
+        self.assertTrue(paths.seams_json.exists())
+        self.assertTrue(paths.gaps_json.exists())
         self.assertTrue(paths.tasks_json.exists())
         self.assertTrue(paths.prd_json.exists())
+        self.assertTrue(paths.runner_parity_json.exists())
         self.assertTrue(paths.exec_context_json.exists())
         self.assertTrue(paths.active_backlog_json.exists())
         self.assertTrue(paths.ledger_file.exists())
         self.assertTrue(paths.project_prd_file.exists())
         self.assertTrue(paths.runner_handoff_file.exists())
+        self.assertFalse(paths.dep_graph_json.exists())
+        self.assertFalse(paths.graph_active_slice_json.exists())
+        self.assertFalse(paths.graph_boundaries_json.exists())
+        self.assertFalse(paths.graph_hotspots_json.exists())
 
         self.assertFalse((paths.memory_dir / "GOALS.md").exists())
         self.assertFalse(paths.legacy_refactor_status_file.exists())
@@ -82,14 +97,17 @@ class RunctlTests(unittest.TestCase):
         self.assertNotIn("conversation_seed_confidence", state)
         self.assertTrue(str(state.get("next_task_id", "")).strip())
         self.assertTrue(str(state.get("next_task", "")).strip())
-        self.assertEqual(state["current_phase"], "discover")
+        self.assertEqual(state["current_phase"], "verify")
         self.assertEqual(state["phase_status"], "active")
         self.assertEqual(state["phase_budget_minutes"], 45)
 
         exec_context = read_json(paths.exec_context_json)
         self.assertIsNotNone(exec_context)
         assert exec_context is not None
-        self.assertEqual(exec_context["phase"], "discover")
+        self.assertEqual(exec_context["phase"], "verify")
+        self.assertFalse(exec_context["graph_enabled"])
+        self.assertFalse(exec_context["parity_enabled"])
+        self.assertEqual(exec_context["parity_surface_ids"], [])
         self.assertIn("context_delta", exec_context)
         self.assertIn("context_sources", exec_context)
         source_paths = {
@@ -104,6 +122,8 @@ class RunctlTests(unittest.TestCase):
         self.assertIsNotNone(active_backlog)
         assert active_backlog is not None
         self.assertEqual(active_backlog["next_task_id"], state["next_task_id"])
+        self.assertIsNone(active_backlog["selected_task"]["graph_cluster_label"])
+        self.assertFalse(active_backlog["selected_task"]["parity_enabled"])
 
     def test_inspect_runner_start_state_requires_setup(self):
         result = inspect_runner_start_state(str(self.dev), "blog", "main")
@@ -190,7 +210,7 @@ class RunctlTests(unittest.TestCase):
         repair_prompt_install.assert_not_called()
 
     def test_runner_prompt_validation_covers_all_canonical_runner_prompts(self):
-        self.assertEqual(set(RUNNER_PROMPT_NAMES), {"run_setup", "run_execute", "run_update", "add"})
+        self.assertEqual(set(RUNNER_PROMPT_NAMES), {"run_setup", "run_execute", "run_govern", "add"})
 
     def test_inspect_runner_start_state_blocks_when_stop_lock_is_present(self):
         initial = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
@@ -376,17 +396,36 @@ class RunctlTests(unittest.TestCase):
         assert refreshed_state is not None
         self.assertEqual(refreshed_state["next_task_id"], "TT-002")
 
-    def test_setup_seeds_default_tasks_when_missing(self):
+    def test_setup_seeds_concrete_tasks_from_prd_when_missing(self):
+        paths = self._paths()
+        write_json(
+            paths.prd_json,
+            {
+                "objective_id": "OBJ-TEST",
+                "title": "Time-track architecture migration",
+                "scope_in": [
+                    "Remove Tailwind-era styling from desktop core surfaces.",
+                    "Move shared primitive styling ownership into Panda recipes.",
+                ],
+                "scope_out": ["Unscoped cleanup not named above"],
+                "success_criteria": ["New architecture owns the touched surfaces without generic fallback tasks."],
+                "constraints": ["Single runner_id=main"],
+                "project_root": str((self.dev / "Repos" / "blog").resolve()),
+                "updated_at": "2026-03-21T00:00:00Z",
+            },
+        )
+
         created = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         self.assertTrue(created["ok"])
 
-        tasks_payload = read_json(self._paths().tasks_json)
+        tasks_payload = read_json(paths.tasks_json)
         self.assertIsNotNone(tasks_payload)
         assert tasks_payload is not None
         tasks = tasks_payload.get("tasks", [])
-        self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0]["task_id"], "TT-001")
-        self.assertEqual(tasks[0]["status"], "open")
+        self.assertEqual([task["task_id"] for task in tasks], ["TT-001", "TT-002"])
+        self.assertEqual(tasks[0]["title"], "Remove Tailwind-era styling from desktop core surfaces.")
+        self.assertEqual(tasks[1]["title"], "Move shared primitive styling ownership into Panda recipes.")
+        self.assertNotIn("Execute the next concrete validated slice toward the active objective.", {task["title"] for task in tasks})
 
     def test_setup_selects_next_task_deterministically_from_tasks_json(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
@@ -603,6 +642,466 @@ class RunctlTests(unittest.TestCase):
         self.assertEqual(exec_context["validation_commands"][0], "pnpm -C desktop exec vitest run src/app-layout/runtime-context.test.ts")
         self.assertEqual(exec_context["coupling_notes"][0], "Crossing into app-store selectors means the slice should be split or escalated.")
 
+    def test_setup_preserves_parity_metadata_and_resolves_compact_exec_context_scope(self):
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        project_root = self.dev / "Repos" / "blog"
+        paths = self._paths()
+
+        write_json(
+            paths.runner_parity_json,
+            {
+                "objective_id": "OBJ-TEST",
+                "baseline_ref": "35ddf4f",
+                "baseline_label": "protected desktop parity baseline",
+                "baseline_git_head": "35ddf4f",
+                "policy": {
+                    "fail_closed": True,
+                    "audit_mode": "targeted",
+                    "default_max_surface_checks_mini": 1,
+                    "default_max_surface_checks_high": 2,
+                    "diff_first": True,
+                    "mcp_when": ["desktop_layout", "interactive_ui"],
+                },
+                "surfaces": [
+                    {
+                        "surface_id": "desktop-main-panes",
+                        "runtime": "desktop",
+                        "kind": "layout_geometry",
+                        "owner_paths": ["desktop/src/app-layout/**"],
+                        "watch_paths": ["desktop/src/app-layout/**", "libs/desktop/app-shell/src/store/**"],
+                        "preferred_mcp": ["playwright", "tauri"],
+                        "baseline_expectation": "Pane sizing and layout geometry match the protected baseline.",
+                        "harness_commands": [
+                            "pnpm -C desktop exec vitest run src/app-layout/paneSizing.test.ts",
+                        ],
+                    },
+                    {
+                        "surface_id": "desktop-tools-toggle",
+                        "runtime": "desktop",
+                        "kind": "interaction_flow",
+                        "owner_paths": ["desktop/src/features/layout/**"],
+                        "watch_paths": ["desktop/src/features/layout/**"],
+                        "preferred_mcp": ["playwright", "tauri"],
+                        "baseline_expectation": "Tools toggle behavior matches the protected baseline.",
+                        "harness_commands": [
+                            "pnpm -C desktop exec vitest run src/features/layout/toolsToggle.test.ts",
+                        ],
+                    },
+                ],
+            },
+        )
+
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-020",
+                    "title": "Harden pane sizing parity checks",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["Preserve pane sizing and tools toggle parity against the protected baseline."],
+                    "validation": ["Run targeted pane sizing regression checks."],
+                    "model_profile": "high",
+                    "profile_reason": "Layout-affecting refactor needs targeted parity enforcement.",
+                    "touch_paths": [
+                        "desktop/src/app-layout/**",
+                        "desktop/src/features/layout/**",
+                    ],
+                    "validation_commands": [
+                        "pnpm -C desktop exec vitest run src/app-layout/paneSizing.test.ts src/features/layout/toolsToggle.test.ts",
+                    ],
+                    "deprecation_phase": "convergence",
+                    "fanout_risk": "high",
+                    "parity_baseline_ref": "35ddf4f",
+                    "parity_surface_ids": ["desktop-main-panes", "desktop-tools-toggle"],
+                    "parity_audit_mode": "targeted",
+                    "parity_harness_commands": [
+                        "pnpm -C desktop exec vitest run src/app-layout/paneSizing.test.ts",
+                    ],
+                    "parity_notes": "Use diff-first parity checks and then inspect the affected desktop surfaces only.",
+                    "updated_at": "2026-03-19T00:00:00Z",
+                }
+            ]
+        )
+
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+
+        tasks_payload = read_json(paths.tasks_json)
+        exec_context = read_json(paths.exec_context_json)
+        active_backlog = read_json(paths.active_backlog_json)
+        parity_payload = read_json(paths.runner_parity_json)
+        self.assertIsNotNone(tasks_payload)
+        self.assertIsNotNone(exec_context)
+        self.assertIsNotNone(active_backlog)
+        self.assertIsNotNone(parity_payload)
+        assert tasks_payload is not None
+        assert exec_context is not None
+        assert active_backlog is not None
+        assert parity_payload is not None
+
+        task = tasks_payload["tasks"][0]
+        self.assertEqual(task["parity_baseline_ref"], "35ddf4f")
+        self.assertEqual(task["parity_surface_ids"], ["desktop-main-panes", "desktop-tools-toggle"])
+        self.assertEqual(task["parity_audit_mode"], "targeted")
+        self.assertEqual(task["parity_harness_commands"][0], "pnpm -C desktop exec vitest run src/app-layout/paneSizing.test.ts")
+
+        self.assertTrue(exec_context["parity_enabled"])
+        self.assertEqual(exec_context["parity_baseline_ref"], "35ddf4f")
+        self.assertEqual(exec_context["parity_surface_ids"], ["desktop-main-panes", "desktop-tools-toggle"])
+        self.assertEqual(exec_context["parity_audit_mode"], "targeted")
+        self.assertEqual(exec_context["parity_trigger_reason"], "task declares parity surfaces; baseline=35ddf4f")
+        self.assertEqual(exec_context["parity_surfaces"][0]["surface_id"], "desktop-main-panes")
+        self.assertEqual(exec_context["parity_harness_commands"][0], "pnpm -C desktop exec vitest run src/app-layout/paneSizing.test.ts")
+        self.assertEqual(exec_context["parity_policy"]["default_max_surface_checks_high"], 2)
+
+        self.assertTrue(active_backlog["selected_task"]["parity_enabled"])
+        self.assertEqual(active_backlog["selected_task"]["parity_baseline_ref"], "35ddf4f")
+        self.assertEqual(active_backlog["selected_task"]["parity_surface_ids_top3"], ["desktop-main-panes", "desktop-tools-toggle"])
+        self.assertEqual(parity_payload["baseline_ref"], "35ddf4f")
+
+    def test_setup_generates_graph_artifacts_when_graph_mode_is_enabled(self):
+        project_root = self.dev / "Repos" / "blog"
+        (project_root / "src").mkdir(parents=True, exist_ok=True)
+        (project_root / "package.json").write_text('{"name":"blog","private":true}\n', encoding="utf-8")
+        (project_root / ".dependency-cruiser.cjs").write_text("module.exports = { forbidden: [], options: {} };\n", encoding="utf-8")
+        (project_root / "src" / "alpha.ts").write_text('import "./beta";\nexport const alpha = 1;\n', encoding="utf-8")
+        (project_root / "src" / "beta.ts").write_text("export const beta = 2;\n", encoding="utf-8")
+        self._write_context_pack(
+            {
+                "repoId": "blog",
+                "graphConfig": {
+                    "enabled": True,
+                    "graph_mode": "dependency_cruiser",
+                    "toolCommand": "pnpm exec depcruise",
+                    "configPath": ".dependency-cruiser.cjs",
+                    "graph_roots": ["src"],
+                    "graph_grouping": "folder_prefix",
+                    "graph_entry_policy": "source_only",
+                    "boundaries": [
+                        {"label": "app", "prefixes": ["src/"]},
+                    ],
+                },
+            }
+        )
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "Graph-backed task",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "touch_paths": ["src/alpha.ts"],
+                    "updated_at": "2026-03-01T00:00:00Z",
+                }
+            ]
+        )
+
+        depcruise_payload = {
+            "modules": [
+                {
+                    "source": "src/alpha.ts",
+                    "dependencies": [
+                        {"resolved": "src/beta.ts"},
+                    ],
+                },
+                {
+                    "source": "src/beta.ts",
+                    "dependencies": [],
+                },
+            ]
+        }
+        with patch("src.runner_graph._run_dependency_cruiser", return_value=depcruise_payload):
+            created = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+
+        self.assertTrue(created["ok"])
+        paths = self._paths()
+        self.assertTrue(paths.dep_graph_json.exists())
+        self.assertTrue(paths.graph_active_slice_json.exists())
+        self.assertTrue(paths.graph_boundaries_json.exists())
+        self.assertTrue(paths.graph_hotspots_json.exists())
+        exec_context = read_json(paths.exec_context_json)
+        active_backlog = read_json(paths.active_backlog_json)
+        self.assertIsNotNone(exec_context)
+        self.assertIsNotNone(active_backlog)
+        assert exec_context is not None
+        assert active_backlog is not None
+        self.assertTrue(exec_context["graph_enabled"])
+        self.assertTrue(exec_context["graph_digest"])
+        self.assertTrue(exec_context["graph_active_slice_digest"])
+        self.assertEqual(exec_context["graph_cluster_label"], "app")
+        self.assertTrue(exec_context["graph_slice_reason"])
+        self.assertEqual(exec_context["graph_adjacent_families_top3"], [])
+        self.assertEqual(active_backlog["selected_task"]["graph_cluster_label"], "app")
+        self.assertTrue(active_backlog["selected_task"]["graph_slice_reason"])
+
+    def test_graph_enabled_setup_leaves_one_open_frontier(self):
+        project_root = self.dev / "Repos" / "blog"
+        (project_root / "src" / "app").mkdir(parents=True, exist_ok=True)
+        (project_root / "src" / "store").mkdir(parents=True, exist_ok=True)
+        (project_root / "package.json").write_text('{"name":"blog","private":true}\n', encoding="utf-8")
+        (project_root / ".dependency-cruiser.cjs").write_text("module.exports = { forbidden: [], options: {} };\n", encoding="utf-8")
+        (project_root / "src" / "app" / "alpha.ts").write_text("export const alpha = 1;\n", encoding="utf-8")
+        (project_root / "src" / "store" / "beta.ts").write_text("export const beta = 1;\n", encoding="utf-8")
+        self._write_context_pack(
+            {
+                "repoId": "blog",
+                "graphConfig": {
+                    "enabled": True,
+                    "graph_mode": "dependency_cruiser",
+                    "toolCommand": "pnpm exec depcruise",
+                    "configPath": ".dependency-cruiser.cjs",
+                    "graph_roots": ["src"],
+                    "boundaries": [
+                        {"label": "app", "prefixes": ["src/app/"]},
+                        {"label": "store", "prefixes": ["src/store/"]},
+                    ],
+                    "slicePriority": ["app", "store"],
+                    "actionableFrontier": "one_open",
+                },
+            }
+        )
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "Finish app slice",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "touch_paths": ["src/app/**"],
+                    "deprecation_phase": "seam",
+                    "fanout_risk": "low",
+                    "model_profile": "mini",
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+                {
+                    "task_id": "TT-002",
+                    "title": "Finish store slice",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "touch_paths": ["src/store/**"],
+                    "deprecation_phase": "seam",
+                    "fanout_risk": "low",
+                    "model_profile": "mini",
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+            ]
+        )
+        depcruise_payload = {
+            "modules": [
+                {"source": "src/app/alpha.ts", "dependencies": []},
+                {"source": "src/store/beta.ts", "dependencies": []},
+            ]
+        }
+
+        with patch("src.runner_graph._run_dependency_cruiser", return_value=depcruise_payload):
+            created = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+
+        self.assertTrue(created["ok"])
+        tasks = read_json(self._paths().tasks_json)["tasks"]
+        by_id = {task["task_id"]: task for task in tasks}
+        self.assertEqual(by_id["TT-001"]["status"], "open")
+        self.assertEqual(by_id["TT-002"]["status"], "blocked")
+        self.assertEqual(by_id["TT-002"]["blocked_reason"], "graph_frontier_waiting_on: TT-001")
+
+    def test_graph_enabled_setup_prefers_dominant_dirty_cluster_in_hybrid_mode(self):
+        project_root = self.dev / "Repos" / "blog"
+        (project_root / "src" / "app").mkdir(parents=True, exist_ok=True)
+        (project_root / "src" / "store").mkdir(parents=True, exist_ok=True)
+        (project_root / "package.json").write_text('{"name":"blog","private":true}\n', encoding="utf-8")
+        (project_root / ".dependency-cruiser.cjs").write_text("module.exports = { forbidden: [], options: {} };\n", encoding="utf-8")
+        (project_root / "src" / "app" / "alpha.ts").write_text("export const alpha = 1;\n", encoding="utf-8")
+        (project_root / "src" / "store" / "beta.ts").write_text("export const beta = 1;\n", encoding="utf-8")
+        self._write_context_pack(
+            {
+                "repoId": "blog",
+                "graphConfig": {
+                    "enabled": True,
+                    "graph_mode": "dependency_cruiser",
+                    "toolCommand": "pnpm exec depcruise",
+                    "configPath": ".dependency-cruiser.cjs",
+                    "graph_roots": ["src"],
+                    "boundaries": [
+                        {"label": "app", "prefixes": ["src/app/"]},
+                        {"label": "store", "prefixes": ["src/store/"]},
+                    ],
+                    "slicePriority": ["store", "app"],
+                    "graphPolicy": "hybrid",
+                    "actionableFrontier": "one_open",
+                },
+            }
+        )
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "Finish app slice",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "touch_paths": ["src/app/**"],
+                    "deprecation_phase": "seam",
+                    "fanout_risk": "low",
+                    "model_profile": "mini",
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+                {
+                    "task_id": "TT-002",
+                    "title": "Finish store slice",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "touch_paths": ["src/store/**"],
+                    "deprecation_phase": "seam",
+                    "fanout_risk": "low",
+                    "model_profile": "mini",
+                    "updated_at": "2026-03-01T00:00:00Z",
+                },
+            ]
+        )
+        depcruise_payload = {
+            "modules": [
+                {"source": "src/app/alpha.ts", "dependencies": []},
+                {"source": "src/store/beta.ts", "dependencies": []},
+            ]
+        }
+
+        with patch("src.runner_graph._run_dependency_cruiser", return_value=depcruise_payload), patch(
+            "src.runctl._list_dirty_paths",
+            return_value=["src/app/alpha.ts"],
+        ):
+            created = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+
+        self.assertTrue(created["ok"])
+        state = read_json(self._paths().state_file)
+        exec_context = read_json(self._paths().exec_context_json)
+        self.assertEqual(state["next_task_id"], "TT-001")
+        self.assertEqual(exec_context["graph_cluster_label"], "app")
+        self.assertIn("dirty path", exec_context["graph_slice_reason"])
+
+    def test_setup_reuses_cached_graph_when_graph_digest_is_unchanged(self):
+        project_root = self.dev / "Repos" / "blog"
+        (project_root / "src").mkdir(parents=True, exist_ok=True)
+        (project_root / "package.json").write_text('{"name":"blog","private":true}\n', encoding="utf-8")
+        (project_root / ".dependency-cruiser.cjs").write_text("module.exports = { forbidden: [], options: {} };\n", encoding="utf-8")
+        (project_root / "src" / "alpha.ts").write_text("export const alpha = 1;\n", encoding="utf-8")
+        self._write_context_pack(
+            {
+                "repoId": "blog",
+                "graphConfig": {
+                    "enabled": True,
+                    "graph_mode": "dependency_cruiser",
+                    "toolCommand": "pnpm exec depcruise",
+                    "configPath": ".dependency-cruiser.cjs",
+                    "graph_roots": ["src"],
+                },
+            }
+        )
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "Graph-backed task",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["done"],
+                    "validation": ["verify"],
+                    "touch_paths": ["src/alpha.ts"],
+                    "updated_at": "2026-03-01T00:00:00Z",
+                }
+            ]
+        )
+        depcruise_payload = {
+            "modules": [
+                {
+                    "source": "src/alpha.ts",
+                    "dependencies": [],
+                }
+            ]
+        }
+        with patch("src.runner_graph._run_dependency_cruiser", return_value=depcruise_payload) as mocked_run:
+            create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+            create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+
+        self.assertEqual(mocked_run.call_count, 1)
+
+    def test_setup_falls_back_cleanly_when_graph_tool_is_unavailable(self):
+        project_root = self.dev / "Repos" / "blog"
+        (project_root / "src").mkdir(parents=True, exist_ok=True)
+        (project_root / "package.json").write_text('{"name":"blog","private":true}\n', encoding="utf-8")
+        (project_root / ".dependency-cruiser.cjs").write_text("module.exports = { forbidden: [], options: {} };\n", encoding="utf-8")
+        (project_root / "src" / "alpha.ts").write_text("export const alpha = 1;\n", encoding="utf-8")
+        self._write_context_pack(
+            {
+                "repoId": "blog",
+                "graphConfig": {
+                    "enabled": True,
+                    "graph_mode": "dependency_cruiser",
+                    "toolCommand": "pnpm exec depcruise",
+                    "configPath": ".dependency-cruiser.cjs",
+                    "graph_roots": ["src"],
+                },
+            }
+        )
+
+        with patch("src.runner_graph._run_dependency_cruiser", return_value=None):
+            created = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+
+        self.assertTrue(created["ok"])
+        paths = self._paths()
+        self.assertFalse(paths.dep_graph_json.exists())
+        self.assertFalse(paths.graph_active_slice_json.exists())
+        exec_context = read_json(paths.exec_context_json)
+        self.assertIsNotNone(exec_context)
+        assert exec_context is not None
+        self.assertFalse(exec_context["graph_enabled"])
+
+    def test_graph_config_preserves_hidden_config_path(self):
+        project_root = self.dev / "Repos" / "blog"
+        self._write_context_pack(
+            {
+                "repoId": "blog",
+                "graphConfig": {
+                    "enabled": True,
+                    "graph_mode": "dependency_cruiser",
+                    "configPath": ".dependency-cruiser.cjs",
+                    "graph_roots": ["src"],
+                },
+            }
+        )
+
+        config = _load_graph_config(project_root)
+        self.assertIsNotNone(config)
+        assert config is not None
+        self.assertEqual(config["config_path"], ".dependency-cruiser.cjs")
+
     def test_setup_skips_open_superseded_task_when_actionable_slice_exists(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         project_root = self.dev / "Repos" / "blog"
@@ -708,9 +1207,9 @@ class RunctlTests(unittest.TestCase):
         source_paths = [Path(item["path"]).name for item in exec_context["context_sources"]]
         self.assertEqual(
             source_paths,
-            ["AGENTS.md", "harness.config.json", "golden-path.md", "context-pack.md", "context-pack.json", "PRD.md"],
+            ["AGENTS.md", "harness.config.json", "golden-path.md", "context-pack.md", "context-pack.json", "PRD.md", "RUNNER_PARITY.json"],
         )
-        self.assertEqual(exec_context["phase"], "discover")
+        self.assertEqual(exec_context["phase"], "verify")
 
     def test_setup_prefers_context_pack_when_required_context_omits_it(self):
         project_root = self.dev / "Repos" / "blog"
@@ -736,7 +1235,7 @@ class RunctlTests(unittest.TestCase):
         source_paths = [Path(item["path"]).name for item in exec_context["context_sources"]]
         self.assertEqual(
             source_paths,
-            ["AGENTS.md", "context-pack.md", "context-pack.json", "harness.config.json", "golden-path.md", "PRD.md"],
+            ["AGENTS.md", "context-pack.md", "context-pack.json", "harness.config.json", "golden-path.md", "PRD.md", "RUNNER_PARITY.json"],
         )
 
     def test_setup_promotes_verify_phase_when_blocker_surface_is_validation(self):
@@ -776,17 +1275,44 @@ class RunctlTests(unittest.TestCase):
         self.assertNotEqual(state["status"], "done")
         self.assertFalse(bool(state["done_candidate"]))
 
-    def test_done_lock_preserved_when_all_tasks_done(self):
+    def test_done_lock_preserved_when_done_closeout_history_exists(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         paths = self._paths()
 
-        tasks_payload = read_json(paths.tasks_json)
-        self.assertIsNotNone(tasks_payload)
-        assert tasks_payload is not None
-        for task in tasks_payload.get("tasks", []):
-            if isinstance(task, dict):
-                task["status"] = "done"
-        write_json(paths.tasks_json, tasks_payload)
+        write_json(
+            paths.tasks_json,
+            {
+                "objective_id": "OBJ-TEST",
+                "tasks": [
+                    {
+                        "task_id": "TT-001",
+                        "title": "Already landed task",
+                        "status": "done",
+                        "priority": "p1",
+                        "depends_on": [],
+                        "project_root": str((self.dev / "Repos" / "blog").resolve()),
+                        "target_branch": "main",
+                        "acceptance": ["done"],
+                        "validation": ["verify"],
+                        "updated_at": "2026-03-01T00:00:00Z",
+                    },
+                    {
+                        "task_id": "TT-002",
+                        "title": "Run final done-closeout `run_gates` check before closing the objective.",
+                        "status": "done",
+                        "priority": "p1",
+                        "depends_on": ["TT-001"],
+                        "project_root": str((self.dev / "Repos" / "blog").resolve()),
+                        "target_branch": "main",
+                        "acceptance": [
+                            "Complete: Final done-closeout `run_gates` validation passes before the runner writes `RUNNER_DONE.lock`.",
+                        ],
+                        "validation": ["Run final done-state gate check (`run_gates`)."],
+                        "updated_at": "2026-03-01T00:00:00Z",
+                    },
+                ],
+            },
+        )
         paths.done_lock.write_text("done\n", encoding="utf-8")
 
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
@@ -797,8 +1323,9 @@ class RunctlTests(unittest.TestCase):
         self.assertEqual(state["status"], "done")
         self.assertTrue(bool(state["done_candidate"]))
         self.assertEqual(state["done_gate_status"], "passed")
+        self.assertEqual(state["dod_status"], "done")
 
-    def test_setup_auto_closes_out_done_state_when_tasks_done_and_gates_pass(self):
+    def test_setup_creates_explicit_closeout_task_before_marking_done(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         paths = self._paths()
         paths.gates_file.parent.mkdir(parents=True, exist_ok=True)
@@ -814,18 +1341,27 @@ class RunctlTests(unittest.TestCase):
 
         result = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         self.assertTrue(result["ok"])
-        self.assertTrue(paths.done_lock.exists())
-        self.assertFalse(paths.enable_pending.exists())
+        self.assertFalse(paths.done_lock.exists())
         state = read_json(paths.state_file)
         self.assertIsNotNone(state)
         assert state is not None
-        self.assertEqual(state["status"], "done")
-        self.assertTrue(bool(state["done_candidate"]))
-        self.assertEqual(state["done_gate_status"], "passed")
+        self.assertEqual(state["status"], "ready")
+        self.assertFalse(bool(state["done_candidate"]))
+        self.assertEqual(state["done_gate_status"], "pending")
         self.assertEqual(state["blockers"], [])
         self.assertEqual(state["current_phase"], "closeout")
+        self.assertEqual(state["phase_status"], "active")
+        self.assertEqual(state["dod_status"], "in_progress")
+        self.assertIsNotNone(state["next_task_id"])
+        self.assertIn("done-closeout", state["next_task"])
+        tasks_payload = read_json(paths.tasks_json)
+        self.assertIsNotNone(tasks_payload)
+        assert tasks_payload is not None
+        open_tasks = [task for task in tasks_payload["tasks"] if task["status"] == "open"]
+        self.assertEqual(len(open_tasks), 1)
+        self.assertIn("done-closeout", open_tasks[0]["title"])
 
-    def test_setup_keeps_runner_open_when_done_closeout_gates_fail(self):
+    def test_setup_creates_pending_closeout_task_when_tasks_collapse_to_zero_and_gates_fail(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         paths = self._paths()
         paths.gates_file.parent.mkdir(parents=True, exist_ok=True)
@@ -847,12 +1383,32 @@ class RunctlTests(unittest.TestCase):
         assert state is not None
         self.assertEqual(state["status"], "ready")
         self.assertFalse(bool(state["done_candidate"]))
-        self.assertEqual(state["done_gate_status"], "failed")
-        self.assertEqual(state["next_task"], "Resolve final done-closeout gate failure.")
-        self.assertIn("Final done closeout blocked:", state["blockers"][0])
+        self.assertEqual(state["done_gate_status"], "pending")
+        self.assertIn("done-closeout", state["next_task"])
+        self.assertEqual(state["blockers"], [])
         self.assertEqual(state["current_phase"], "closeout")
+        self.assertEqual(state["dod_status"], "in_progress")
 
-    def test_setup_auto_completes_final_run_gates_task_when_it_is_only_open_work(self):
+    def test_setup_clears_stale_done_dod_status_when_runner_is_not_complete(self):
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        paths = self._paths()
+        state = read_json(paths.state_file)
+        self.assertIsNotNone(state)
+        assert state is not None
+        state["status"] = "ready"
+        state["dod_status"] = "done"
+        write_json(paths.state_file, state)
+
+        result = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        self.assertTrue(result["ok"])
+
+        refreshed = read_json(paths.state_file)
+        self.assertIsNotNone(refreshed)
+        assert refreshed is not None
+        self.assertNotEqual(refreshed["status"], "done")
+        self.assertEqual(refreshed["dod_status"], "in_progress")
+
+    def test_setup_keeps_explicit_closeout_task_open_even_when_run_gates_is_green(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         paths = self._paths()
         paths.gates_file.parent.mkdir(parents=True, exist_ok=True)
@@ -895,18 +1451,19 @@ class RunctlTests(unittest.TestCase):
 
         result = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         self.assertTrue(result["ok"])
-        self.assertTrue(paths.done_lock.exists())
+        self.assertFalse(paths.done_lock.exists())
         state = read_json(paths.state_file)
         self.assertIsNotNone(state)
         assert state is not None
-        self.assertEqual(state["status"], "done")
-        self.assertIsNone(state["next_task_id"])
+        self.assertEqual(state["status"], "ready")
+        self.assertEqual(state["done_gate_status"], "passed")
+        self.assertEqual(state["next_task_id"], "TT-002")
         self.assertEqual(state["current_phase"], "closeout")
         tasks_payload = read_json(paths.tasks_json)
         self.assertIsNotNone(tasks_payload)
         assert tasks_payload is not None
         task_statuses = {task["task_id"]: task["status"] for task in tasks_payload["tasks"]}
-        self.assertEqual(task_statuses["TT-002"], "done")
+        self.assertEqual(task_statuses["TT-002"], "open")
 
     def test_clear_is_two_phase_and_deletes_runner_managed_project_prd(self):
         create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
@@ -1165,13 +1722,40 @@ class RunctlTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        tasks_payload = read_json(paths.tasks_json)
-        self.assertIsNotNone(tasks_payload)
-        assert tasks_payload is not None
-        for task in tasks_payload.get("tasks", []):
-            if isinstance(task, dict):
-                task["status"] = "done"
-        write_json(paths.tasks_json, tasks_payload)
+        write_json(
+            paths.tasks_json,
+            {
+                "objective_id": "OBJ-TEST",
+                "tasks": [
+                    {
+                        "task_id": "TT-001",
+                        "title": "Already landed task",
+                        "status": "done",
+                        "priority": "p1",
+                        "depends_on": [],
+                        "project_root": str((self.dev / "Repos" / "blog").resolve()),
+                        "target_branch": "main",
+                        "acceptance": ["done"],
+                        "validation": ["verify"],
+                        "updated_at": "2026-03-01T00:00:00Z",
+                    },
+                    {
+                        "task_id": "TT-002",
+                        "title": "Run final done-closeout `run_gates` check before closing the objective.",
+                        "status": "open",
+                        "priority": "p1",
+                        "depends_on": ["TT-001"],
+                        "project_root": str((self.dev / "Repos" / "blog").resolve()),
+                        "target_branch": "main",
+                        "acceptance": [
+                            "Complete: Final done-closeout `run_gates` validation passes before the runner writes `RUNNER_DONE.lock`.",
+                        ],
+                        "validation": ["Run final done-state gate check (`run_gates`)."],
+                        "updated_at": "2026-03-01T00:00:00Z",
+                    },
+                ],
+            },
+        )
 
         result = create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
         self.assertTrue(result["ok"])
@@ -1238,6 +1822,63 @@ class RunctlTests(unittest.TestCase):
         assert tasks_payload is not None
         tasks_payload["tasks"][0]["acceptance"] = ["rewritten acceptance after semantic split"]
         tasks_payload["tasks"][1]["title"] = "Blocked child split from same active task"
+        write_json(paths.tasks_json, tasks_payload)
+
+        setup_code = run(["--setup", "--project", "blog", "--runner-id", "main", "--dev", str(self.dev), "--quiet"])
+        self.assertEqual(setup_code, 0)
+
+        refreshed_exec_context = read_json(paths.exec_context_json)
+        self.assertIsNotNone(refreshed_exec_context)
+        assert refreshed_exec_context is not None
+        refreshed_baseline = refreshed_exec_context.get("cycle_progress_baseline")
+        refreshed_progress = refreshed_exec_context.get("progress_baseline")
+        self.assertIsInstance(refreshed_baseline, dict)
+        self.assertIsInstance(refreshed_progress, dict)
+        self.assertEqual(refreshed_exec_context["next_task_id"], "TT-001")
+        self.assertEqual(refreshed_baseline["next_task_id"], baseline["next_task_id"])
+        self.assertEqual(refreshed_baseline["worktree_fingerprint"], baseline["worktree_fingerprint"])
+        self.assertEqual(refreshed_baseline["active_backlog_digest"], baseline["active_backlog_digest"])
+        self.assertNotEqual(refreshed_progress["active_backlog_digest"], baseline["active_backlog_digest"])
+
+        prepare_code = run(["--prepare-cycle", "--project", "blog", "--runner-id", "main", "--dev", str(self.dev)])
+        self.assertEqual(prepare_code, 0)
+        self.assertTrue(paths.cycle_prepared_file.exists())
+
+    def test_prepare_cycle_accepts_same_next_task_when_semantic_task_fields_change(self):
+        project_root = self.dev / "Repos" / "blog"
+        self._write_tasks(
+            [
+                {
+                    "task_id": "TT-001",
+                    "title": "Primary active task",
+                    "status": "open",
+                    "priority": "p1",
+                    "depends_on": [],
+                    "project_root": str(project_root),
+                    "target_branch": "main",
+                    "acceptance": ["Keep the primitive contract tight."],
+                    "validation": ["Run shared UI tests."],
+                    "validation_commands": ["pnpm test"],
+                    "profile_reason": "Initial bounded slice.",
+                    "spillover_paths": ["libs/web/ui/**"],
+                    "updated_at": "2026-03-18T00:00:00Z",
+                }
+            ]
+        )
+        create_runner_state(str(self.dev), "blog", "main", approve_enable=None)
+        paths = self._paths()
+        before_exec_context = read_json(paths.exec_context_json)
+        self.assertIsNotNone(before_exec_context)
+        assert before_exec_context is not None
+        baseline = before_exec_context.get("cycle_progress_baseline")
+        self.assertIsInstance(baseline, dict)
+
+        tasks_payload = read_json(paths.tasks_json)
+        self.assertIsNotNone(tasks_payload)
+        assert tasks_payload is not None
+        tasks_payload["tasks"][0]["validation_commands"] = ["pnpm test", "pnpm lint"]
+        tasks_payload["tasks"][0]["profile_reason"] = "Scope narrowed after backlog repair."
+        tasks_payload["tasks"][0]["spillover_paths"] = ["libs/web/ui/**", "libs/desktop/ui/**"]
         write_json(paths.tasks_json, tasks_payload)
 
         setup_code = run(["--setup", "--project", "blog", "--runner-id", "main", "--dev", str(self.dev), "--quiet"])

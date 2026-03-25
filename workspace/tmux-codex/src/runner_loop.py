@@ -53,9 +53,9 @@ RUNNER_UPDATE_END_MARKER = "RUNNER_UPDATE_END"
 REQUIRED_UPDATE_KEYS = (
     "summary",
     "completed",
-    "completed_task_ids",
-    "next_task",
-    "next_task_reason",
+    "completed_seam_ids",
+    "next_seam",
+    "next_seam_reason",
     "blockers",
     "remaining_gaps",
     "done_candidate",
@@ -76,6 +76,8 @@ RUNNER_UPDATE_VISIBLE_HOLD_SECONDS = 1.2
 RUNNER_DISPATCH_IDLE_GRACE_SECONDS = 1.0
 RUNNER_COMPLETION_IDLE_GRACE_SECONDS = 1.0
 RUNNER_UPDATE_PENDING_PREFIX = "update_pending"
+RUNNER_RECOVERY_TASK_TITLE_PREFIX = "Diagnose stalled runner recovery for"
+RUNNER_FALLBACK_COMPLETION_STABLE_SECONDS = 4.0
 
 
 @dataclass(frozen=True)
@@ -133,7 +135,7 @@ def resolve_runner_profile(complexity: str, model_override: str | None) -> tuple
     return mapped_model, effort
 
 
-def _normalize_task_model_profile(raw: object) -> str | None:
+def _normalize_seam_model_profile(raw: object) -> str | None:
     candidate = str(raw or "").strip().lower()
     if candidate in TASK_MODEL_PROFILE_MAP:
         return candidate
@@ -154,7 +156,7 @@ def _pending_update_profile_from_state(state: dict[str, object] | None) -> str |
     if not current_step.startswith(RUNNER_UPDATE_PENDING_PREFIX):
         return None
     _, _, raw_profile = current_step.partition(":")
-    profile = _normalize_task_model_profile(raw_profile)
+    profile = _normalize_seam_model_profile(raw_profile)
     return profile or "mini"
 
 
@@ -168,47 +170,141 @@ def _parse_status_directive(text: str, key: str) -> str | None:
 
 def _parse_execute_update_request(text: str) -> dict[str, str | bool]:
     needs_update = _parse_status_directive(text, "needs_update")
-    update_profile = _normalize_task_model_profile(_parse_status_directive(text, "update_profile"))
+    update_profile = _normalize_seam_model_profile(_parse_status_directive(text, "update_profile"))
     update_reason = _parse_status_directive(text, "update_reason")
     scope_status = _normalize_scope_status(_parse_status_directive(text, "scope_status"))
+    phase_done = _parse_status_directive(text, "phase_done")
     requested = needs_update == "yes"
     return {
         "needs_update": requested,
         "update_profile": update_profile or "mini",
         "update_reason": update_reason or "",
         "scope_status": scope_status,
+        "phase_done": phase_done == "yes",
     }
 
 
-def _active_task_from_tasks_payload(paths: RunnerStatePaths, task_id: str | None) -> dict[str, object] | None:
-    payload = read_json(paths.tasks_json)
-    if not isinstance(payload, dict):
-        return None
-    tasks = payload.get("tasks")
+def _has_completion_directive_for_step(text: str, step: Literal["execute", "update"]) -> bool:
+    if _parse_status_directive(text, "exiting") != "yes":
+        return False
+    if step == "execute":
+        return any(
+            _parse_status_directive(text, key) is not None
+            for key in ("phase_done", "validation", "needs_update", "scope_status")
+        )
+    return _parse_status_directive(text, "state_repaired") is not None
+
+
+def _session_profile_for_dispatch(
+    *,
+    model_profile: str | None,
+    model: str,
+    reasoning_effort: str,
+) -> str | None:
+    normalized = _normalize_seam_model_profile(model_profile)
+    if normalized:
+        return normalized
+    for candidate, (candidate_model, candidate_effort) in TASK_MODEL_PROFILE_MAP.items():
+        if model == candidate_model and reasoning_effort == candidate_effort:
+            return candidate
+    return None
+
+
+def _can_continue_update_in_same_session(
+    *,
+    requested_profile: str,
+    session_profile: str | None,
+) -> bool:
+    if requested_profile != "high":
+        return True
+    return session_profile == "high"
+
+
+def _prepare_same_session_update_handoff(
+    *,
+    state_paths: RunnerStatePaths,
+    state: dict[str, object],
+    phase: str,
+    update_profile: str,
+    scope_status: str,
+    reason: str | None,
+    active_step: Literal["execute", "update"],
+) -> dict[str, object]:
+    next_state = update_state(
+        state_paths.state_file,
+        state,
+        status="running",
+        current_step=f"{RUNNER_UPDATE_PENDING_PREFIX}:{update_profile}",
+    )
+    _append_ledger(
+        state_paths,
+        "runner.update_requested_same_session",
+        phase=phase,
+        update_profile=update_profile,
+        scope_status=scope_status,
+        reason=reason or None,
+        source_step=active_step,
+    )
+    _log_line(
+        state_paths,
+        (
+            f"{active_step.capitalize()} requested semantic run_govern for phase={phase}; "
+            "continuing in the same Codex session to preserve context"
+        ),
+    )
+    return next_state
+
+
+def _active_seam_from_runtime_payload(paths: RunnerStatePaths, seam_id: str | None) -> dict[str, object] | None:
+    payload = read_json(paths.seams_json)
+    tasks = payload.get("seams") if isinstance(payload, dict) else None
+    id_key = "seam_id"
+    if not isinstance(tasks, list):
+        payload = read_json(paths.tasks_json)
+        if not isinstance(payload, dict):
+            return None
+        tasks = payload.get("tasks")
+        id_key = "task_id"
     if not isinstance(tasks, list):
         return None
-    normalized_task_id = str(task_id or "").strip()
-    if normalized_task_id:
+    normalized_seam_id = str(seam_id or "").strip()
+    if normalized_seam_id:
         for raw in tasks:
             if not isinstance(raw, dict):
                 continue
-            if str(raw.get("task_id", "")).strip() == normalized_task_id:
+            if str(raw.get(id_key, "")).strip() == normalized_seam_id:
+                if id_key == "seam_id":
+                    return {
+                        "seam_id": str(raw.get("seam_id", "")).strip(),
+                        "title": raw.get("title"),
+                        "status": raw.get("status"),
+                        "model_profile": raw.get("model_profile"),
+                        "profile_reason": raw.get("why_now"),
+                    }
                 return raw
     for raw in tasks:
         if not isinstance(raw, dict):
             continue
-        if str(raw.get("status", "")).strip().lower() in {"open", "in_progress", "blocked"}:
-            return raw
+            if str(raw.get("status", "")).strip().lower() in {"open", "in_progress", "blocked"}:
+                if id_key == "seam_id":
+                    return {
+                        "seam_id": str(raw.get("seam_id", "")).strip(),
+                        "title": raw.get("title"),
+                        "status": raw.get("status"),
+                        "model_profile": raw.get("model_profile"),
+                        "profile_reason": raw.get("why_now"),
+                    }
+                return raw
     return None
 
 
-def resolve_active_task_execution_profile(
+def resolve_active_seam_execution_profile(
     *,
     paths: RunnerStatePaths,
     fallback_model: str,
     fallback_reasoning_effort: str,
 ) -> dict[str, str | None]:
-    """Resolve the current task routing profile from exec-context/state with safe fallback."""
+    """Resolve the current seam routing profile from exec-context/state with safe fallback."""
     exec_context = read_json(paths.exec_context_json)
     state = read_json(paths.state_file)
     if not isinstance(exec_context, dict):
@@ -218,10 +314,10 @@ def resolve_active_task_execution_profile(
 
     pending_update_profile = _pending_update_profile_from_state(state)
 
-    task_id = str(exec_context.get("task_id") or exec_context.get("next_task_id") or state.get("next_task_id") or "").strip()
-    task_title = str(exec_context.get("task_title") or exec_context.get("next_task") or state.get("next_task") or "").strip()
+    seam_id = str(exec_context.get("seam_id") or exec_context.get("task_id") or exec_context.get("next_task_id") or state.get("active_seam_id") or state.get("next_task_id") or "").strip()
+    seam_title = str(exec_context.get("seam_title") or exec_context.get("task_title") or exec_context.get("next_task") or state.get("next_task") or "").strip()
     profile_reason = str(exec_context.get("profile_reason") or "").strip()
-    model_profile = _normalize_task_model_profile(exec_context.get("model_profile"))
+    model_profile = _normalize_seam_model_profile(exec_context.get("model_profile"))
     profile_source = "exec_context"
 
     if pending_update_profile:
@@ -230,20 +326,22 @@ def resolve_active_task_execution_profile(
             "model_profile": pending_update_profile,
             "model": model,
             "reasoning_effort": reasoning_effort,
-            "task_id": task_id or None,
-            "task_title": task_title or None,
-            "profile_reason": "Pending semantic run_update session after execute slice.",
+            "seam_id": seam_id or None,
+            "seam_title": seam_title or None,
+            "task_id": seam_id or None,
+            "task_title": seam_title or None,
+            "profile_reason": "Pending semantic run_govern session after execute slice.",
             "source": "pending_update",
         }
 
-    task = None
-    if not model_profile or not task_title or not profile_reason:
-        task = _active_task_from_tasks_payload(paths, task_id or None)
-        if isinstance(task, dict):
-            task_id = task_id or str(task.get("task_id", "")).strip()
-            task_title = task_title or str(task.get("title", "")).strip()
-            profile_reason = profile_reason or str(task.get("profile_reason", "")).strip()
-            model_profile = model_profile or _normalize_task_model_profile(task.get("model_profile"))
+    seam = None
+    if not model_profile or not seam_title or not profile_reason:
+        seam = _active_seam_from_runtime_payload(paths, seam_id or None)
+        if isinstance(seam, dict):
+            seam_id = seam_id or str(seam.get("seam_id") or seam.get("task_id", "")).strip()
+            seam_title = seam_title or str(seam.get("title", "")).strip()
+            profile_reason = profile_reason or str(seam.get("profile_reason", "")).strip()
+            model_profile = model_profile or _normalize_seam_model_profile(seam.get("model_profile"))
             profile_source = "tasks_json"
 
     if model_profile:
@@ -252,8 +350,10 @@ def resolve_active_task_execution_profile(
             "model_profile": model_profile,
             "model": model,
             "reasoning_effort": reasoning_effort,
-            "task_id": task_id or None,
-            "task_title": task_title or None,
+            "seam_id": seam_id or None,
+            "seam_title": seam_title or None,
+            "task_id": seam_id or None,
+            "task_title": seam_title or None,
             "profile_reason": profile_reason or None,
             "source": profile_source,
         }
@@ -262,11 +362,27 @@ def resolve_active_task_execution_profile(
         "model_profile": None,
         "model": fallback_model,
         "reasoning_effort": fallback_reasoning_effort,
-        "task_id": task_id or None,
-        "task_title": task_title or None,
+        "seam_id": seam_id or None,
+        "seam_title": seam_title or None,
+        "task_id": seam_id or None,
+        "task_title": seam_title or None,
         "profile_reason": profile_reason or None,
         "source": "fallback",
     }
+
+
+def resolve_active_task_execution_profile(
+    *,
+    paths: RunnerStatePaths,
+    fallback_model: str,
+    fallback_reasoning_effort: str,
+) -> dict[str, str | None]:
+    """Compatibility alias for seam-based routing profile resolution."""
+    return resolve_active_seam_execution_profile(
+        paths=paths,
+        fallback_model=fallback_model,
+        fallback_reasoning_effort=fallback_reasoning_effort,
+    )
 
 
 def _run_scripted_cycle_refresh(
@@ -311,6 +427,13 @@ def _run_scripted_cycle_refresh(
     return True, None
 
 
+def _reload_refreshed_runner_state(state_file: Path, fallback_state: dict[str, object]) -> dict[str, object]:
+    refreshed_state = read_json(state_file)
+    if isinstance(refreshed_state, dict):
+        return refreshed_state
+    return fallback_state
+
+
 def _write_runner_stop_lock(
     *,
     state_paths: RunnerStatePaths,
@@ -332,6 +455,106 @@ def _write_runner_stop_lock(
     )
 
 
+def _is_no_durable_progress_refresh_failure(reason: str | None) -> bool:
+    normalized = str(reason or "").strip().lower()
+    return "no durable progress" in normalized
+
+
+def _next_recovery_task_id(state_paths: RunnerStatePaths) -> str:
+    highest = 0
+    for path in (state_paths.tasks_json, state_paths.task_intake_file):
+        payload = read_json(path)
+        if not isinstance(payload, dict):
+            continue
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, list):
+            continue
+        for raw in tasks:
+            if not isinstance(raw, dict):
+                continue
+            task_id = str(raw.get("task_id", "")).strip()
+            match = re.match(r"^TT-(\d+)$", task_id)
+            if match:
+                highest = max(highest, int(match.group(1)))
+    return f"TT-{highest + 1:03d}"
+
+
+def _build_no_progress_recovery_title(*, stalled_task_id: str | None, stalled_task_title: str | None) -> str:
+    task_id = str(stalled_task_id or "").strip()
+    task_title = str(stalled_task_title or "").strip()
+    if task_id and task_title:
+        return f"{RUNNER_RECOVERY_TASK_TITLE_PREFIX} {task_id}: {task_title}"
+    if task_id:
+        return f"{RUNNER_RECOVERY_TASK_TITLE_PREFIX} {task_id}"
+    return f"{RUNNER_RECOVERY_TASK_TITLE_PREFIX} the current slice"
+
+
+def _queue_no_progress_recovery_task(
+    *,
+    state_paths: RunnerStatePaths,
+    state: dict[str, object],
+    project_root: Path,
+    failure_reason: str,
+    stalled_task_id: str | None,
+    stalled_task_title: str | None,
+) -> tuple[bool, str]:
+    recovery_title = _build_no_progress_recovery_title(
+        stalled_task_id=stalled_task_id,
+        stalled_task_title=stalled_task_title,
+    )
+    tasks_payload = read_json(state_paths.tasks_json) or {}
+    intake_payload = read_json(state_paths.task_intake_file) or {}
+    objective_id = str(tasks_payload.get("objective_id") or state.get("objective_id") or "").strip()
+    target_branch = str(state.get("target_branch") or "main").strip() or "main"
+
+    for payload, include_status in ((tasks_payload, True), (intake_payload, False)):
+        tasks = payload.get("tasks") if isinstance(payload, dict) else None
+        if not isinstance(tasks, list):
+            continue
+        for raw in tasks:
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("title", "")).strip() != recovery_title:
+                continue
+            status = str(raw.get("status", "")).strip().lower()
+            if not include_status or status in {"open", "in_progress", "blocked"}:
+                task_id = str(raw.get("task_id", "")).strip() or "(pending)"
+                return True, task_id
+
+    queued_tasks = intake_payload.get("tasks")
+    if not isinstance(queued_tasks, list):
+        queued_tasks = []
+        intake_payload["tasks"] = queued_tasks
+
+    queued_task_id = _next_recovery_task_id(state_paths)
+    task_label = str(stalled_task_id or "current slice").strip()
+    queued_tasks.append(
+        {
+            "task_id": queued_task_id,
+            "title": recovery_title,
+            "priority": "p0",
+            "depends_on": [],
+            "acceptance": [
+                f"Identify why {task_label} exited run_govern without durable progress.",
+                "Rewrite or split the active backlog so the next cycle has one explicit actionable recovery slice.",
+                "Preserve the current objective and do not relax acceptance or validation contracts while repairing the backlog.",
+            ],
+            "validation": [
+                "TASKS.json or queued runner intake shows a concrete next slice that explains the stall instead of repeating the same broad title.",
+                "The recovery keeps one actionable frontier and records any blocked sibling slices explicitly.",
+                "The next runner refresh selects a durable backlog change instead of repeating the prior no-progress state.",
+            ],
+            "project_root": str(project_root.resolve()),
+            "target_branch": target_branch,
+            "objective_id": objective_id or None,
+            "queued_at": utc_now(),
+            "reason": failure_reason[:220],
+        }
+    )
+    write_json(state_paths.task_intake_file, intake_payload)
+    return True, queued_task_id
+
+
 def render_runner_profile_shell_exports(profile: dict[str, str | None]) -> str:
     """Render shell-safe assignments for per-cycle runner model selection."""
     shell_vars = {
@@ -339,8 +562,10 @@ def render_runner_profile_shell_exports(profile: dict[str, str | None]) -> str:
         "RUNNER_REASONING_EFFORT": profile.get("reasoning_effort") or "",
         "RUNNER_MODEL_PROFILE": profile.get("model_profile") or "",
         "RUNNER_PROFILE_REASON": profile.get("profile_reason") or "",
-        "RUNNER_TASK_ID": profile.get("task_id") or "",
-        "RUNNER_TASK_TITLE": profile.get("task_title") or "",
+        "RUNNER_SEAM_ID": profile.get("seam_id") or profile.get("task_id") or "",
+        "RUNNER_SEAM_TITLE": profile.get("seam_title") or profile.get("task_title") or "",
+        "RUNNER_TASK_ID": profile.get("seam_id") or profile.get("task_id") or "",
+        "RUNNER_TASK_TITLE": profile.get("seam_title") or profile.get("task_title") or "",
         "RUNNER_PROFILE_SOURCE": profile.get("source") or "",
     }
     return "\n".join(f"{name}={shlex.quote(value)}" for name, value in shell_vars.items())
@@ -571,7 +796,7 @@ def _build_update_command(
     project_root: Path,
 ) -> str:
     return (
-        f"/prompts:run_update "
+        f"/prompts:run_govern "
         f"DEV={dev} "
         f"PROJECT={project} "
         f"RUNNER_ID={runner_id} "
@@ -793,6 +1018,8 @@ while true; do
   RUNNER_REASONING_EFFORT={q_reasoning_effort}
   RUNNER_MODEL_PROFILE=""
   RUNNER_PROFILE_REASON=""
+  RUNNER_SEAM_ID=""
+  RUNNER_SEAM_TITLE=""
   RUNNER_TASK_ID=""
   RUNNER_TASK_TITLE=""
   RUNNER_PROFILE_SOURCE="fallback"
@@ -809,7 +1036,7 @@ while true; do
   else
     log_supervisor "profile resolution failed rc=$PROFILE_RC; using launcher defaults"
   fi
-  log_supervisor "launching cycle model_profile=${{RUNNER_MODEL_PROFILE:-fallback}} model=$RUNNER_MODEL effort=$RUNNER_REASONING_EFFORT task_id=${{RUNNER_TASK_ID:-}} source=${{RUNNER_PROFILE_SOURCE:-fallback}}"
+  log_supervisor "launching cycle model_profile=${{RUNNER_MODEL_PROFILE:-fallback}} model=$RUNNER_MODEL effort=$RUNNER_REASONING_EFFORT seam_id=${{RUNNER_SEAM_ID:-}} source=${{RUNNER_PROFILE_SOURCE:-fallback}}"
 
   (cd {q_repo_home} && PYTHONPATH={q_repo_home}${{PYTHONPATH:+:$PYTHONPATH}} python3 -m src.main __runner-controller \
     --project {q_project} \
@@ -897,7 +1124,11 @@ def _extract_open_tasks(tasks_file: Path, max_items: int = 40) -> list[str]:
     payload = read_json(tasks_file)
     if not isinstance(payload, dict):
         return []
-    tasks = payload.get("tasks")
+    tasks = payload.get("seams")
+    id_key = "seam_id"
+    if not isinstance(tasks, list):
+        tasks = payload.get("tasks")
+        id_key = "task_id"
     if not isinstance(tasks, list):
         return []
 
@@ -908,12 +1139,25 @@ def _extract_open_tasks(tasks_file: Path, max_items: int = 40) -> list[str]:
         status = str(raw.get("status", "")).strip().lower()
         if status not in {"open", "in_progress", "blocked"}:
             continue
-        task_id = str(raw.get("task_id", "")).strip() or "(id)"
+        task_id = str(raw.get(id_key, "")).strip() or "(id)"
         title = str(raw.get("title", "")).strip() or "(untitled)"
         items.append(f"{task_id}: {title}"[:220])
         if len(items) >= max_items:
             break
     return items
+
+
+def _extract_open_runner_backlog(project_root: Path) -> tuple[list[str], str]:
+    seams_file = project_root / ".memory" / "runner" / "SEAMS.json"
+    open_items = _extract_open_tasks(seams_file)
+    if open_items:
+        return open_items, "SEAMS.json"
+
+    tasks_file = project_root / ".memory" / "runner" / "TASKS.json"
+    fallback_items = _extract_open_tasks(tasks_file)
+    if fallback_items:
+        return fallback_items, "TASKS.json"
+    return [], "SEAMS.json"
 
 
 def _append_ledger(paths: RunnerStatePaths, event: str, **payload: object) -> None:
@@ -966,8 +1210,12 @@ def _build_prompt(project: str, runner_id: str, paths: RunnerStatePaths) -> str:
     blocker_items = _compact_list(state.get("blockers"), limit=3, item_chars=120)
     snapshot = {
         "objective_id": str(state.get("objective_id", "")).strip(),
+        "active_seam_id": str(state.get("active_seam_id", "")).strip(),
+        "next_seam_id": str(state.get("next_seam_id", "") or state.get("next_task_id", "")).strip(),
         "next_task_id": str(state.get("next_task_id", "")).strip(),
         "current_goal": str(state.get("current_goal", "")).strip(),
+        "next_seam": str(state.get("next_seam", "") or state.get("next_task", "")).strip(),
+        "next_seam_reason": str(state.get("next_seam_reason", "") or state.get("next_task_reason", "")).strip(),
         "next_task": str(state.get("next_task", "")).strip(),
         "next_task_reason": str(state.get("next_task_reason", "")).strip(),
         "implementation_plan_top2": plan_items,
@@ -995,15 +1243,15 @@ Rules:
 2. Update code and tests as needed.
 3. Do not create the done lock early.
 4. Before creating done lock, source .memory/gates.sh and run run_gates.
-5. Only create done lock if run_gates succeeds and .memory/runner/TASKS.json has zero tasks in open|in_progress|blocked.
-6. Use .memory/runner/RUNNER_EXEC_CONTEXT.json plus .memory/runner/RUNNER_ACTIVE_BACKLOG.json and runner state to respect the current phase goal and next task. Treat RUNNER_HANDOFF.md as human/manual recovery context, not default per-cycle input.
+5. Only create done lock if run_gates succeeds and .memory/runner/SEAMS.json has zero seams in open|in_progress|blocked.
+6. Use .memory/runner/OBJECTIVE.json, .memory/runner/SEAMS.json, .memory/runner/GAPS.json, .memory/runner/RUNNER_EXEC_CONTEXT.json, .memory/runner/RUNNER_ACTIVE_BACKLOG.json, optional .memory/runner/graph/RUNNER_GRAPH_ACTIVE_SLICE.json, and runner state to respect the current phase goal and active seam. Treat RUNNER_HANDOFF.md as human/manual recovery context, not default per-cycle input.
 7. End your response with this exact machine-parsable block:
 RUNNER_UPDATE_START
-{{"summary":"...","completed":["..."],"completed_task_ids":["TT-..."],"next_task":"...","next_task_reason":"...","blockers":["..."],"remaining_gaps":["..."],"done_candidate":false}}
+{{"summary":"...","completed":["..."],"completed_seam_ids":["TT-..."],"next_seam":"...","next_seam_reason":"...","blockers":["..."],"remaining_gaps":["..."],"done_candidate":false}}
 RUNNER_UPDATE_END
 8. The JSON must be valid and include all required keys exactly once.
 9. Before finalizing, review your work against the active acceptance and ask: "Any problems with the current implementation?" Put every real remaining issue in `remaining_gaps`.
-10. If you fully completed a task this slice, list its canonical task id in `completed_task_ids`. Do not rely on prose alone.
+10. If you fully completed an active seam this slice, list its canonical seam id in `completed_seam_ids`. Do not rely on prose alone.
 
 Runner state snapshot:
 {state_context}
@@ -1038,31 +1286,39 @@ def _extract_update_payload(raw_lines: list[str]) -> tuple[dict[str, object] | N
     if not isinstance(payload, dict):
         return None, "runner update payload must be a JSON object"
 
-    for key in REQUIRED_UPDATE_KEYS:
-        if key not in payload:
-            return None, f"runner update missing required key: {key}"
+    seam_keys_missing = [key for key in REQUIRED_UPDATE_KEYS if key not in payload]
+    legacy_keys = ("completed_task_ids", "next_task", "next_task_reason")
+    if seam_keys_missing:
+        if not all(key in payload for key in legacy_keys):
+            return None, f"runner update missing required key: {seam_keys_missing[0]}"
+        payload = {
+            **payload,
+            "completed_seam_ids": payload.get("completed_task_ids"),
+            "next_seam": payload.get("next_task"),
+            "next_seam_reason": payload.get("next_task_reason"),
+        }
 
     summary = payload.get("summary")
-    next_task = payload.get("next_task")
-    next_task_reason = payload.get("next_task_reason")
+    next_seam = payload.get("next_seam")
+    next_seam_reason = payload.get("next_seam_reason")
     completed = payload.get("completed")
-    completed_task_ids = payload.get("completed_task_ids")
+    completed_seam_ids = payload.get("completed_seam_ids")
     blockers = payload.get("blockers")
     remaining_gaps = payload.get("remaining_gaps")
     done_candidate = payload.get("done_candidate")
 
     if not isinstance(summary, str) or not summary.strip():
         return None, "runner update summary must be a non-empty string"
-    if not isinstance(next_task, str) or not next_task.strip():
-        return None, "runner update next_task must be a non-empty string"
-    if not isinstance(next_task_reason, str) or not next_task_reason.strip():
-        return None, "runner update next_task_reason must be a non-empty string"
+    if not isinstance(next_seam, str) or not next_seam.strip():
+        return None, "runner update next_seam must be a non-empty string"
+    if not isinstance(next_seam_reason, str) or not next_seam_reason.strip():
+        return None, "runner update next_seam_reason must be a non-empty string"
     if not isinstance(done_candidate, bool):
         return None, "runner update done_candidate must be a boolean"
     if not isinstance(completed, list) or not all(isinstance(item, str) for item in completed):
         return None, "runner update completed must be a string array"
-    if not isinstance(completed_task_ids, list) or not all(isinstance(item, str) for item in completed_task_ids):
-        return None, "runner update completed_task_ids must be a string array"
+    if not isinstance(completed_seam_ids, list) or not all(isinstance(item, str) for item in completed_seam_ids):
+        return None, "runner update completed_seam_ids must be a string array"
     if not isinstance(blockers, list) or not all(isinstance(item, str) for item in blockers):
         return None, "runner update blockers must be a string array"
     if not isinstance(remaining_gaps, list) or not all(isinstance(item, str) for item in remaining_gaps):
@@ -1075,9 +1331,12 @@ def _extract_update_payload(raw_lines: list[str]) -> tuple[dict[str, object] | N
     normalized: dict[str, object] = {
         "summary": summary.strip(),
         "completed": [item.strip() for item in completed if item.strip()],
-        "completed_task_ids": [item.strip() for item in completed_task_ids if item.strip()],
-        "next_task": next_task.strip(),
-        "next_task_reason": next_task_reason.strip(),
+        "completed_seam_ids": [item.strip() for item in completed_seam_ids if item.strip()],
+        "completed_task_ids": [item.strip() for item in completed_seam_ids if item.strip()],
+        "next_seam": next_seam.strip(),
+        "next_task": next_seam.strip(),
+        "next_seam_reason": next_seam_reason.strip(),
+        "next_task_reason": next_seam_reason.strip(),
         "blockers": [item.strip() for item in blockers if item.strip()],
         "remaining_gaps": normalized_remaining_gaps,
         "done_candidate": done_candidate,
@@ -1098,8 +1357,8 @@ def _build_finalize_hook_prompt(
     state: dict[str, object],
 ) -> str:
     safe_message = final_message.strip() or "(no final message)"
-    current_next = str(state.get("next_task", "")).strip() or "Execute the next concrete validated slice."
-    current_reason = str(state.get("next_task_reason", "")).strip() or "Carry forward prior plan context."
+    current_next = str(state.get("next_seam", "") or state.get("next_task", "")).strip() or "Execute the next concrete validated slice."
+    current_reason = str(state.get("next_seam_reason", "") or state.get("next_task_reason", "")).strip() or "Carry forward prior plan context."
     return f"""The previous runner response failed strict parsing.
 
 Parse failure:
@@ -1110,7 +1369,7 @@ Last assistant message:
 
 Return ONLY this block format:
 RUNNER_UPDATE_START
-{{"summary":"...","completed":["..."],"completed_task_ids":["TT-..."],"next_task":"...","next_task_reason":"...","blockers":["..."],"remaining_gaps":["..."],"done_candidate":false}}
+{{"summary":"...","completed":["..."],"completed_seam_ids":["TT-..."],"next_seam":"...","next_seam_reason":"...","blockers":["..."],"remaining_gaps":["..."],"done_candidate":false}}
 RUNNER_UPDATE_END
 
 Rules:
@@ -1118,10 +1377,10 @@ Rules:
 - If the work is clearly complete, set "done_candidate": true.
 - If uncertain, set "done_candidate": false.
 - If any real issue, rough edge, regression, or acceptance gap remains, list it in "remaining_gaps" and do not mark done.
-- If you fully completed the active task, include its canonical task id in "completed_task_ids".
+- If you fully completed the active seam, include its canonical seam id in "completed_seam_ids".
 - Preserve continuity with current next task when no better signal exists:
-  next_task="{current_next}"
-  next_task_reason="{current_reason}"
+  next_seam="{current_next}"
+  next_seam_reason="{current_reason}"
 """
 
 
@@ -1154,23 +1413,26 @@ def _fallback_update_payload(
     done_candidate = False
 
     if inferred_done_candidate:
-        next_task = str(state.get("next_task", "")).strip() or "Review the prior slice for any remaining gaps."
-        next_task_reason = (
+        next_seam = str(state.get("next_seam", "") or state.get("next_task", "")).strip() or "Review the prior slice for any remaining gaps."
+        next_seam_reason = (
             "Completion was inferred from free-form output, but structured self-review failed; "
-            "keep the current task open until remaining gaps are explicitly cleared."
+            "keep the current seam open until remaining gaps are explicitly cleared."
         )
     else:
-        next_task = str(state.get("next_task", "")).strip() or "Execute the next concrete validated slice."
-        next_task_reason = str(state.get("next_task_reason", "")).strip() or (
+        next_seam = str(state.get("next_seam", "") or state.get("next_task", "")).strip() or "Execute the next concrete validated slice."
+        next_seam_reason = str(state.get("next_seam_reason", "") or state.get("next_task_reason", "")).strip() or (
             "Structured runner update missing; carrying forward previous next step."
         )
 
     return {
         "summary": summary,
         "completed": completed,
+        "completed_seam_ids": [],
         "completed_task_ids": [],
-        "next_task": next_task,
-        "next_task_reason": next_task_reason,
+        "next_seam": next_seam,
+        "next_task": next_seam,
+        "next_seam_reason": next_seam_reason,
+        "next_task_reason": next_seam_reason,
         "blockers": blockers,
         "remaining_gaps": remaining_gaps,
         "done_candidate": done_candidate,
@@ -1247,11 +1509,11 @@ def _apply_iteration_update(
     session_id: str | None,
 ) -> dict[str, object]:
     completed_recent = list(update_payload.get("completed", []))
-    completed_task_ids = list(update_payload.get("completed_task_ids", []))
+    completed_seam_ids = list(update_payload.get("completed_seam_ids", update_payload.get("completed_task_ids", [])))
     blockers = list(update_payload.get("blockers", []))
     remaining_gaps = list(update_payload.get("remaining_gaps", []))
-    next_task = str(update_payload.get("next_task", "")).strip()
-    next_task_reason = str(update_payload.get("next_task_reason", "")).strip()
+    next_seam = str(update_payload.get("next_seam", update_payload.get("next_task", ""))).strip()
+    next_seam_reason = str(update_payload.get("next_seam_reason", update_payload.get("next_task_reason", ""))).strip()
     summary = str(update_payload.get("summary", "")).strip()
     done_candidate = bool(update_payload.get("done_candidate", False))
     for gap in remaining_gaps:
@@ -1265,12 +1527,15 @@ def _apply_iteration_update(
         paths.state_file,
         state,
         session_id=session_id,
-        current_goal=next_task,
+        current_goal=next_seam,
         last_iteration_summary=summary,
         completed_recent=completed_recent,
-        completed_task_ids=completed_task_ids,
-        next_task=next_task,
-        next_task_reason=next_task_reason,
+        completed_seam_ids=completed_seam_ids,
+        completed_task_ids=completed_seam_ids,
+        next_seam=next_seam,
+        next_task=next_seam,
+        next_seam_reason=next_seam_reason,
+        next_task_reason=next_seam_reason,
         blockers=blockers,
         done_candidate=done_candidate,
         done_gate_status="pending",
@@ -1413,9 +1678,9 @@ def run_loop_runner(
                 break
 
             if paths.done_lock.exists():
-                _log_line(paths, "Done lock detected; validating gates + TASKS.json")
+                _log_line(paths, "Done lock detected; validating gates + SEAMS.json")
                 gates_ok, gates_output = _run_gates(paths.gates_file, project_root, runner_id)
-                open_tasks = _extract_open_tasks(project_root / ".memory" / "runner" / "TASKS.json")
+                open_tasks, backlog_label = _extract_open_runner_backlog(project_root)
                 tasks_ok = len(open_tasks) == 0
                 _append_ledger(
                     paths,
@@ -1431,7 +1696,7 @@ def run_loop_runner(
                     if not tasks_ok:
                         _log_line(
                             paths,
-                            "Done candidate rejected: TASKS.json has open/in_progress/blocked tasks "
+                            f"Done candidate rejected: {backlog_label} has open/in_progress/blocked seams "
                             f"({len(open_tasks)} remaining)",
                         )
                     paths.done_lock.unlink(missing_ok=True)
@@ -1475,7 +1740,7 @@ def run_loop_runner(
                 },
             )
 
-            iteration_profile = resolve_active_task_execution_profile(
+            iteration_profile = resolve_active_seam_execution_profile(
                 paths=paths,
                 fallback_model=model,
                 fallback_reasoning_effort=reasoning_effort,
@@ -1498,7 +1763,7 @@ def run_loop_runner(
                 model=iteration_model,
                 reasoning_effort=iteration_reasoning_effort,
                 model_profile=iteration_profile.get("model_profile"),
-                task_id=iteration_profile.get("task_id"),
+                task_id=iteration_profile.get("seam_id") or iteration_profile.get("task_id"),
                 profile_source=iteration_profile.get("source"),
             )
             hooks.emit(
@@ -1511,7 +1776,7 @@ def run_loop_runner(
                     "model": iteration_model,
                     "reasoning_effort": iteration_reasoning_effort,
                     "model_profile": iteration_profile.get("model_profile"),
-                    "task_id": iteration_profile.get("task_id"),
+                    "task_id": iteration_profile.get("seam_id") or iteration_profile.get("task_id"),
                 },
             )
 
@@ -1600,9 +1865,9 @@ def run_loop_runner(
             )
             completion_action = "none"
             if bool(update_payload.get("done_candidate", False)):
-                _log_line(paths, "Done candidate update detected; validating gates + TASKS.json before lock creation")
+                _log_line(paths, "Done candidate update detected; validating gates + SEAMS.json before lock creation")
                 gates_ok, gates_output = _run_gates(paths.gates_file, project_root, runner_id)
-                open_tasks = _extract_open_tasks(project_root / ".memory" / "runner" / "TASKS.json")
+                open_tasks, backlog_label = _extract_open_runner_backlog(project_root)
                 tasks_ok = len(open_tasks) == 0
                 _append_ledger(
                     paths,
@@ -1627,7 +1892,7 @@ def run_loop_runner(
                     if not tasks_ok:
                         _log_line(
                             paths,
-                            "Done candidate rejected: TASKS.json has open/in_progress/blocked tasks "
+                            f"Done candidate rejected: {backlog_label} has open/in_progress/blocked seams "
                             f"({len(open_tasks)} remaining)",
                         )
                     _log_line(paths, "Done candidate rejected because validation failed")
@@ -1766,7 +2031,7 @@ def run_runner_profile(argv: list[str]) -> int:
         project=args.project,
         runner_id=args.runner_id,
     )
-    profile = resolve_active_task_execution_profile(
+    profile = resolve_active_seam_execution_profile(
         paths=paths,
         fallback_model=args.default_model,
         fallback_reasoning_effort=args.default_reasoning_effort,
@@ -1854,6 +2119,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
     dispatched_at = 0.0
     saw_busy = False
     idle_since: float | None = None
+    session_model_profile: str | None = pending_update_profile or None
     try:
         while True:
             if not tmux.has_session(session_name):
@@ -1914,6 +2180,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                     saw_busy = True
                 prompt_completed = False
                 if pane_state == "idle" and completion_idle_grace_satisfied:
+                    explicit_completion = _has_completion_directive_for_step(output, active_step)
                     lower_output = output.lower()
                     execute_prompt_cleared = (
                         active_step == "execute"
@@ -1921,11 +2188,19 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         and not _pane_contains_exact_prompt(output, dispatched_command)
                         and "send saved prompt" not in lower_output
                     )
-                    if saw_busy:
+                    fallback_completion_stable = (now - last_output_change_at) >= max(
+                        RUNNER_FALLBACK_COMPLETION_STABLE_SECONDS,
+                        args.poll_seconds * 6,
+                    )
+                    if explicit_completion:
                         prompt_completed = True
-                    elif execute_prompt_cleared:
+                    elif fallback_completion_stable and saw_busy:
                         prompt_completed = True
-                    elif output != dispatch_output_snapshot and (now - dispatched_at) >= max(2.0, args.poll_seconds * 3):
+                    elif fallback_completion_stable and execute_prompt_cleared:
+                        prompt_completed = True
+                    elif fallback_completion_stable and output != dispatch_output_snapshot and (
+                        now - dispatched_at
+                    ) >= max(2.0, args.poll_seconds * 3):
                         prompt_completed = True
 
                 if prompt_completed and active_step == "execute":
@@ -1937,16 +2212,16 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                     )
                     _log_line(state_paths, f"Execute completed for phase={injected_phase}")
                     update_request = _parse_execute_update_request(output)
+                    closeout_incomplete = injected_phase == "closeout" and not bool(update_request.get("phase_done"))
+                    if closeout_incomplete and not bool(update_request.get("needs_update")):
+                        update_request["needs_update"] = True
+                        update_request["update_profile"] = "mini"
+                        update_request["scope_status"] = "narrow"
+                        update_request["update_reason"] = "closeout_phase_incomplete"
                     if bool(update_request.get("needs_update")):
                         update_profile = str(update_request.get("update_profile") or "mini")
                         update_reason = str(update_request.get("update_reason") or "").strip()
                         scope_status = str(update_request.get("scope_status") or "ok")
-                        state = update_state(
-                            state_paths.state_file,
-                            state,
-                            status="running",
-                            current_step=f"{RUNNER_UPDATE_PENDING_PREFIX}:{update_profile}",
-                        )
                         _append_ledger(
                             state_paths,
                             "runner.update_requested",
@@ -1958,9 +2233,36 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         _log_line(
                             state_paths,
                             (
-                                f"Execute requested semantic run_update for phase={injected_phase}; "
-                                f"scheduling fresh {update_profile} update session"
+                                f"Execute requested semantic run_govern for phase={injected_phase}; "
+                                f"update_profile={update_profile}"
                             ),
+                        )
+                        if _can_continue_update_in_same_session(
+                            requested_profile=update_profile,
+                            session_profile=session_model_profile,
+                        ):
+                            state = _prepare_same_session_update_handoff(
+                                state_paths=state_paths,
+                                state=state,
+                                phase=injected_phase,
+                                update_profile=update_profile,
+                                scope_status=scope_status,
+                                reason=update_reason or None,
+                                active_step="execute",
+                            )
+                            pending_update_profile = update_profile
+                            active_step = "update"
+                            in_flight = False
+                            saw_busy = False
+                            dispatch_output_snapshot = ""
+                            dispatched_command = ""
+                            dispatched_at = 0.0
+                            continue
+                        state = update_state(
+                            state_paths.state_file,
+                            state,
+                            status="running",
+                            current_step=f"{RUNNER_UPDATE_PENDING_PREFIX}:{update_profile}",
                         )
                     else:
                         refresh_ok, refresh_error = _run_scripted_cycle_refresh(
@@ -1970,12 +2272,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                             project_root=project_root,
                         )
                         if refresh_ok:
-                            state = update_state(
-                                state_paths.state_file,
-                                state,
-                                status="running",
-                                current_step="",
-                            )
+                            state = _reload_refreshed_runner_state(state_paths.state_file, state)
                             _append_ledger(
                                 state_paths,
                                 "runner.scripted_refresh_complete",
@@ -2005,9 +2302,30 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                                 state_paths,
                                 (
                                     f"Scripted refresh failed after execute for phase={injected_phase}; "
-                                    f"falling back to fresh mini run_update reason={refresh_error or 'unknown'}"
+                                    f"falling back to semantic run_govern reason={refresh_error or 'unknown'}"
                                 ),
                             )
+                            if _can_continue_update_in_same_session(
+                                requested_profile="mini",
+                                session_profile=session_model_profile,
+                            ):
+                                state = _prepare_same_session_update_handoff(
+                                    state_paths=state_paths,
+                                    state=state,
+                                    phase=injected_phase,
+                                    update_profile="mini",
+                                    scope_status="narrow",
+                                    reason=refresh_error or None,
+                                    active_step="execute",
+                                )
+                                pending_update_profile = "mini"
+                                active_step = "update"
+                                in_flight = False
+                                saw_busy = False
+                                dispatch_output_snapshot = ""
+                                dispatched_command = ""
+                                dispatched_at = 0.0
+                                continue
                     eof_sent = tmux.send_eof(session_name)
                     if not eof_sent:
                         _append_ledger(
@@ -2037,6 +2355,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                 if prompt_completed and active_step == "update":
                     scope_status = _normalize_scope_status(_parse_status_directive(output, "scope_status"))
                     active_update_profile = pending_update_profile or "mini"
+                    recovered = False
                     refresh_ok, refresh_error = _run_scripted_cycle_refresh(
                         dev=dev,
                         project=project,
@@ -2082,7 +2401,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                             state_paths,
                             f"Requested Codex chat exit after update for phase={injected_phase}; next loop will relaunch fresh",
                         )
-                        state = update_state(state_paths.state_file, state, status="running", current_step="")
+                        state = _reload_refreshed_runner_state(state_paths.state_file, state)
                         return 0
                     failure_reason = refresh_error or "scripted_refresh_failed_after_update"
                     _append_ledger(
@@ -2115,38 +2434,106 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                             state_paths,
                             (
                                 f"Update completed for phase={injected_phase} but scripted refresh still failed; "
-                                "scheduling a fresh high run_update recovery cycle"
+                                "scheduling a fresh high run_govern recovery cycle"
                             ),
                         )
                     else:
-                        _write_runner_stop_lock(
-                            state_paths=state_paths,
-                            source="runner_update_failure",
-                            reason=failure_reason,
-                            phase=injected_phase,
-                            session_name=session_name,
-                        )
-                        state = update_state(
-                            state_paths.state_file,
-                            state,
-                            status="error",
-                            current_step="",
-                        )
-                        _append_ledger(
-                            state_paths,
-                            "runner.update_retry_exhausted",
-                            phase=injected_phase,
-                            session_name=session_name,
-                            reason=failure_reason,
-                            scope_status=scope_status,
-                        )
-                        _log_line(
-                            state_paths,
-                            (
-                                f"High run_update finished for phase={injected_phase} but scripted refresh still failed; "
-                                "stopping the infinite runner with an explicit recovery error"
-                            ),
-                        )
+                        recovered = False
+                        recovery_task_id = ""
+                        if _is_no_durable_progress_refresh_failure(failure_reason):
+                            recovered, recovery_task_id = _queue_no_progress_recovery_task(
+                                state_paths=state_paths,
+                                state=state,
+                                project_root=project_root,
+                                failure_reason=failure_reason,
+                                stalled_task_id=str(state.get("next_task_id", "")).strip() or None,
+                                stalled_task_title=str(state.get("next_task", "")).strip() or None,
+                            )
+                            if recovered:
+                                _append_ledger(
+                                    state_paths,
+                                    "runner.no_progress_recovery_queued",
+                                    phase=injected_phase,
+                                    session_name=session_name,
+                                    reason=failure_reason,
+                                    recovery_task_id=recovery_task_id or None,
+                                    stalled_task_id=str(state.get("next_task_id", "")).strip() or None,
+                                )
+                                _log_line(
+                                    state_paths,
+                                    (
+                                        f"Queued recovery task {recovery_task_id or '(pending)'} after repeated no-progress "
+                                        "run_govern failure; attempting deterministic refresh"
+                                    ),
+                                )
+                                refresh_ok, refresh_error = _run_scripted_cycle_refresh(
+                                    dev=dev,
+                                    project=project,
+                                    runner_id=runner_id,
+                                    project_root=project_root,
+                                )
+                                if refresh_ok:
+                                    state = _reload_refreshed_runner_state(state_paths.state_file, state)
+                                    _append_ledger(
+                                        state_paths,
+                                        "runner.no_progress_recovery_ready",
+                                        phase=injected_phase,
+                                        session_name=session_name,
+                                        recovery_task_id=recovery_task_id or None,
+                                    )
+                                    _log_line(
+                                        state_paths,
+                                        (
+                                            f"Recovery task {recovery_task_id or '(pending)'} prepared successfully after "
+                                            f"no-progress update failure; next loop will relaunch fresh"
+                                        ),
+                                    )
+                                else:
+                                    recovered = False
+                                    _append_ledger(
+                                        state_paths,
+                                        "runner.no_progress_recovery_refresh_failed",
+                                        phase=injected_phase,
+                                        session_name=session_name,
+                                        recovery_task_id=recovery_task_id or None,
+                                        error=refresh_error or "unknown",
+                                    )
+                                    _log_line(
+                                        state_paths,
+                                        (
+                                            f"Recovery task {recovery_task_id or '(pending)'} was queued after no-progress "
+                                            f"update failure, but deterministic refresh still failed reason={refresh_error or 'unknown'}"
+                                        ),
+                                    )
+                        if not recovered:
+                            _write_runner_stop_lock(
+                                state_paths=state_paths,
+                                source="runner_update_failure",
+                                reason=failure_reason,
+                                phase=injected_phase,
+                                session_name=session_name,
+                            )
+                            state = update_state(
+                                state_paths.state_file,
+                                state,
+                                status="error",
+                                current_step="",
+                            )
+                            _append_ledger(
+                                state_paths,
+                                "runner.update_retry_exhausted",
+                                phase=injected_phase,
+                                session_name=session_name,
+                                reason=failure_reason,
+                                scope_status=scope_status,
+                            )
+                            _log_line(
+                                state_paths,
+                                (
+                                    f"High run_govern finished for phase={injected_phase} but scripted refresh still failed; "
+                                    "stopping the infinite runner with an explicit recovery error"
+                                ),
+                            )
                     eof_sent = tmux.send_eof(session_name)
                     if not eof_sent:
                         _append_ledger(
@@ -2171,16 +2558,21 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         state_paths,
                         (
                             f"Requested Codex chat exit after update refresh failure for phase={injected_phase}; "
-                            f"next recovery step is {'fresh high run_update' if active_update_profile != 'high' else 'runner error stop'}"
+                            f"next recovery step is {'fresh high run_govern' if active_update_profile != 'high' else ('fresh recovery triage' if recovered else 'runner error stop')}"
                         ),
                     )
-                    return 0 if active_update_profile != "high" else 1
+                    return 0 if active_update_profile != "high" or recovered else 1
 
             if not in_flight and pane_state == "idle" and dispatch_idle_grace_satisfied:
-                active_profile = resolve_active_task_execution_profile(
+                active_profile = resolve_active_seam_execution_profile(
                     paths=state_paths,
                     fallback_model="gpt-5.4",
                     fallback_reasoning_effort="high",
+                )
+                session_model_profile = _session_profile_for_dispatch(
+                    model_profile=str(active_profile.get("model_profile") or "").strip() or None,
+                    model=str(active_profile.get("model") or "").strip(),
+                    reasoning_effort=str(active_profile.get("reasoning_effort") or "").strip(),
                 )
                 if active_step == "execute":
                     command = _build_execute_only_command(
@@ -2207,7 +2599,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                     )
                     _log_line(
                         state_paths,
-                        f"Dispatching /prompts:run_update for phase={phase} in {session_name}",
+                        f"Dispatching /prompts:run_govern for phase={phase} in {session_name}",
                     )
                 sent, dispatch_failure_reason = _submit_runner_prompt(
                     tmux=tmux,
@@ -2235,7 +2627,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         model=active_profile.get("model"),
                         reasoning_effort=active_profile.get("reasoning_effort"),
                         model_profile=active_profile.get("model_profile"),
-                        task_id=active_profile.get("task_id"),
+                        task_id=active_profile.get("seam_id") or active_profile.get("task_id"),
                     )
                     if active_step == "update":
                         _append_ledger(
@@ -2247,7 +2639,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         )
                         _log_line(
                             state_paths,
-                            f"Dispatched /prompts:run_update for phase={phase}; waiting for prepared marker before fresh restart",
+                            f"Dispatched /prompts:run_govern for phase={phase}; waiting for prepared marker before fresh restart",
                         )
                     else:
                         _log_line(
@@ -2278,7 +2670,7 @@ def run_interactive_runner_controller(argv: list[str]) -> int:
                         )
                         _log_line(
                             state_paths,
-                            f"Failed to dispatch /prompts:run_update for phase={phase} in {session_name} reason={dispatch_failure_reason or 'unknown'}",
+                            f"Failed to dispatch /prompts:run_govern for phase={phase} in {session_name} reason={dispatch_failure_reason or 'unknown'}",
                         )
                     else:
                         _log_line(

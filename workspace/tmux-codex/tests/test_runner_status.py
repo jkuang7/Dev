@@ -63,6 +63,30 @@ class RunnerStatusTests(unittest.TestCase):
         self.assertEqual(state, "working")
 
     @patch("src.runner_status.time.time", return_value=100.0)
+    def test_mcp_startup_marker_keeps_runner_working_even_with_stale_prompt(self, _mock_time):
+        out = "\n".join(
+            [
+                "OpenAI Codex",
+                "› /prompts:run_execute DEV=/Users/jian/Dev PROJECT=Blog",
+                "mcp startup: initializing servers: playwright, panda, context7",
+            ]
+        )
+        state = detect_runner_state(out, process_name="node", last_activity_ts=99.5)
+        self.assertEqual(state, "working")
+
+    @patch("src.runner_status.time.time", return_value=100.0)
+    def test_mcp_startup_interrupted_banner_is_not_treated_as_idle(self, _mock_time):
+        out = "\n".join(
+            [
+                "OpenAI Codex",
+                "⚠ MCP startup interrupted. The following servers were not initialized:",
+                "playwright, panda, context7",
+            ]
+        )
+        state = detect_runner_state(out, process_name="node", last_activity_ts=99.5)
+        self.assertEqual(state, "working")
+
+    @patch("src.runner_status.time.time", return_value=100.0)
     def test_error_text_does_not_override_idle_prompt(self, _mock_time):
         out = "zsh:1: no such file or directory: /run\n❯ /run blog --runner-id main\n"
         state = detect_runner_state(out, process_name="codex", last_activity_ts=70.0)
