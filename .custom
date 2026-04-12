@@ -77,7 +77,8 @@ clls() {
 alias clh='codex "$REPOS_HOME/helix-work"'
 
 alias aero='pgrep -x AeroSpace >/dev/null || open -a AeroSpace; sleep 0.5; aerospace reload-config 2>/dev/null'
-alias boostrap='node "$WORKSPACE_HOME/scripts/repos-bootstrap.mjs" generate && node "$WORKSPACE_HOME/scripts/repos-bootstrap.mjs" bootstrap'
+alias bs:pull='(cd "$DEV" && npm run bootstrap:pull)'
+alias bs:push='(cd "$DEV" && npm run bootstrap:push)'
 
 #=======================================
 # Development Aliases
