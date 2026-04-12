@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,11 +11,23 @@ const DEFAULT_DEV_ROOT = path.resolve(__dirname, "../..");
 
 const CONFIG_HEADER = [
   "# Managed repositories - one per line",
-  "# Format: <directory>\\t<remote-origin-url>",
+  "# Format: <directory>\\t<remote-origin-url>[\\t<branch>]",
   "# Remove line to stop bootstrap management (won't auto-delete local folders)",
   "# Generated from standalone git repos under Repos/*",
   "",
 ];
+
+const DEFAULT_BRANCH = "main";
+const DEV_BOOTSTRAP_BLOCK_START = "# >>> dev-bootstrap >>>";
+const DEV_BOOTSTRAP_BLOCK_END = "# <<< dev-bootstrap <<<";
+const LEGACY_ZSHRC_BLOCK = [
+  "# Bootstrap - source shared shell config from Dev root",
+  "# .custom contains: aliases, functions, automations, and reusable config",
+  "# Edit with: ce (opens .custom)  |  Reload with: cs (sources .custom)",
+  '_p="$HOME/Dev/.custom"',
+  '[[ -r "$_p" ]] && source "$_p" || echo "⚠ .custom not found at $_p"',
+  "unset _p",
+].join("\n");
 
 const SUPPORTED_PACKAGE_MANAGERS = new Map([
   ["pnpm", { install: ["install"] }],
@@ -189,11 +202,14 @@ function runGenerate(args) {
 }
 
 function runBootstrap(args) {
+  ensureShellHook(args.devRoot);
   ensureDirectoryExists(args.reposRoot, "Repos root");
   const entries = parseConfigFile(args.configPath);
   const summary = {
     cloned: 0,
     exists: 0,
+    syncOk: 0,
+    syncSkipped: 0,
     installOk: 0,
     buildOk: 0,
     buildSkipped: 0,
@@ -217,6 +233,16 @@ function runBootstrap(args) {
         summary.warnings += 1;
         console.warn(`${repoPrefix} warning: ${resolution.reason}`);
         continue;
+      }
+
+      const syncOutcome = syncRepo(resolution.repoPath, entry.branch, repoPrefix);
+      if (syncOutcome.synced) {
+        summary.syncOk += 1;
+      } else {
+        summary.syncSkipped += 1;
+        if (syncOutcome.warning) {
+          summary.warnings += 1;
+        }
       }
 
       const installOutcome = runInstallSetup(resolution.repoPath, repoPrefix);
@@ -249,6 +275,8 @@ function runBootstrap(args) {
   console.log("Summary:");
   console.log(`cloned: ${summary.cloned}`);
   console.log(`exists: ${summary.exists}`);
+  console.log(`sync ok: ${summary.syncOk}`);
+  console.log(`sync skipped: ${summary.syncSkipped}`);
   console.log(`install ok: ${summary.installOk}`);
   console.log(`build ok: ${summary.buildOk}`);
   console.log(`build skipped: ${summary.buildSkipped}`);
@@ -273,7 +301,14 @@ function ensureDirectoryExists(directoryPath, label) {
 }
 
 function buildConfigFile(entries) {
-  const lines = [...CONFIG_HEADER, ...entries.map((entry) => `${entry.directory}\t${entry.url}`)];
+  const lines = [
+    ...CONFIG_HEADER,
+    ...entries.map((entry) =>
+      entry.branch && entry.branch !== DEFAULT_BRANCH
+        ? `${entry.directory}\t${entry.url}\t${entry.branch}`
+        : `${entry.directory}\t${entry.url}`,
+    ),
+  ];
   return `${lines.join("\n")}\n`;
 }
 
@@ -306,21 +341,22 @@ function parseConfigFile(configPath) {
     }
 
     const parts = rawLine.split("\t");
-    if (parts.length !== 2) {
-      throw new Error(`Invalid config line ${lineNumber}: expected "<directory>\\t<remote-origin-url>"`);
+    if (parts.length < 2 || parts.length > 3) {
+      throw new Error(`Invalid config line ${lineNumber}: expected "<directory>\\t<remote-origin-url>[\\t<branch>]"`);
     }
 
-    const [directory, url] = parts;
+    const [directory, url, branchRaw] = parts;
     validateConfigDirectory(directory, lineNumber);
     if (!url) {
       throw new Error(`Invalid config line ${lineNumber}: missing remote-origin-url`);
     }
+    const branch = branchRaw ? validateConfigBranch(branchRaw, lineNumber) : DEFAULT_BRANCH;
 
     if (seenDirectories.has(directory)) {
       throw new Error(`Invalid config line ${lineNumber}: duplicate directory "${directory}"`);
     }
     seenDirectories.add(directory);
-    entries.push({ directory, url });
+    entries.push({ directory, url, branch });
   }
 
   return entries;
@@ -338,6 +374,18 @@ function validateConfigDirectory(directory, lineNumber) {
   if (directory.includes("/") || directory.includes("\\") || directory.includes("..")) {
     throw new Error(`Invalid config line ${lineNumber}: invalid directory "${directory}"`);
   }
+}
+
+function validateConfigBranch(branch, lineNumber) {
+  if (!branch.trim()) {
+    throw new Error(`Invalid config line ${lineNumber}: missing branch`);
+  }
+
+  if (/\s/.test(branch)) {
+    throw new Error(`Invalid config line ${lineNumber}: invalid branch "${branch}"`);
+  }
+
+  return branch;
 }
 
 function reconcileRepo(entry, reposRoot, repoPrefix) {
@@ -377,6 +425,79 @@ function reconcileRepo(entry, reposRoot, repoPrefix) {
 function cloneRepo(url, targetPath, repoPrefix) {
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   runCommand("git", ["clone", url, targetPath], { cwd: path.dirname(targetPath), label: `${repoPrefix} clone` });
+}
+
+function syncRepo(repoPath, branch, repoPrefix) {
+  const status = runCommandCapture("git", ["-C", repoPath, "status", "--porcelain"], {
+    label: `${repoPrefix} status`,
+  });
+  if (status.stdout.trim()) {
+    console.warn(`${repoPrefix} warning: sync skipped (dirty worktree)`);
+    return { synced: false, warning: true };
+  }
+
+  const branchResult = runCommandCapture("git", ["-C", repoPath, "symbolic-ref", "--quiet", "--short", "HEAD"], {
+    label: `${repoPrefix} branch`,
+    allowFailure: true,
+  });
+  if (branchResult.status !== 0) {
+    console.warn(`${repoPrefix} warning: sync skipped (detached HEAD)`);
+    return { synced: false, warning: true };
+  }
+
+  const currentBranch = branchResult.stdout.trim();
+  if (currentBranch !== branch) {
+    console.warn(`${repoPrefix} warning: sync skipped (current branch ${currentBranch}, expected ${branch})`);
+    return { synced: false, warning: true };
+  }
+
+  runCommand("git", ["-C", repoPath, "fetch", "--prune", "origin"], {
+    label: `${repoPrefix} fetch`,
+    cwd: repoPath,
+  });
+
+  const remoteRef = `origin/${branch}`;
+  const remoteHead = runCommandCapture("git", ["-C", repoPath, "rev-parse", "--verify", remoteRef], {
+    label: `${repoPrefix} remote ref`,
+    allowFailure: true,
+  });
+  if (remoteHead.status !== 0) {
+    console.warn(`${repoPrefix} warning: sync skipped (missing ${remoteRef})`);
+    return { synced: false, warning: true };
+  }
+
+  const localHead = runCommandCapture("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+    label: `${repoPrefix} head`,
+  });
+  if (localHead.stdout.trim() === remoteHead.stdout.trim()) {
+    console.log(`${repoPrefix} sync ok (already up to date)`);
+    return { synced: true, warning: false };
+  }
+
+  const ffCheck = runCommandCapture("git", ["-C", repoPath, "merge-base", "--is-ancestor", "HEAD", remoteRef], {
+    label: `${repoPrefix} fast-forward check`,
+    allowFailure: true,
+  });
+  if (ffCheck.status === 0) {
+    runCommand("git", ["-C", repoPath, "pull", "--ff-only", "origin", branch], {
+      label: `${repoPrefix} pull`,
+      cwd: repoPath,
+    });
+    console.log(`${repoPrefix} sync ok (fast-forwarded ${branch})`);
+    return { synced: true, warning: false };
+  }
+
+  const aheadCheck = runCommandCapture("git", ["-C", repoPath, "merge-base", "--is-ancestor", remoteRef, "HEAD"], {
+    label: `${repoPrefix} ahead check`,
+    allowFailure: true,
+  });
+  if (aheadCheck.status === 0) {
+    console.warn(`${repoPrefix} warning: sync skipped (local ${branch} is ahead of ${remoteRef})`);
+    return { synced: false, warning: true };
+  }
+
+  console.warn(`${repoPrefix} warning: sync skipped (local ${branch} diverged from ${remoteRef})`);
+  return { synced: false, warning: true };
 }
 
 function isDirectoryEmpty(directoryPath) {
@@ -637,4 +758,121 @@ function runCommand(commandName, args, options) {
   if (result.status !== 0) {
     throw new Error(`${options.label} failed with exit code ${result.status}`);
   }
+}
+
+function runCommandCapture(commandName, args, options) {
+  const result = spawnSync(commandName, args, {
+    cwd: options.cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: process.env,
+  });
+
+  if (result.error) {
+    if (result.error.code === "ENOENT") {
+      throw new Error(`${options.label} failed: executable not found (${commandName})`);
+    }
+
+    throw result.error;
+  }
+
+  if (!options.allowFailure && result.status !== 0) {
+    const stderr = result.stderr?.trim();
+    throw new Error(stderr ? `${options.label} failed: ${stderr}` : `${options.label} failed with exit code ${result.status}`);
+  }
+
+  return {
+    status: result.status ?? 0,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  };
+}
+
+function ensureShellHook(devRoot) {
+  const homeDir = resolveHomeDirectory();
+  const pointerDir = path.join(homeDir, ".config", "dev-bootstrap");
+  const pointerPath = path.join(pointerDir, "root");
+  const zshrcPath = path.join(homeDir, ".zshrc");
+
+  fs.mkdirSync(pointerDir, { recursive: true });
+  writeFileAtomically(pointerPath, `${devRoot}\n`);
+
+  const existingZshrc = fs.existsSync(zshrcPath) ? fs.readFileSync(zshrcPath, "utf8") : "";
+  const updatedZshrc = updateZshrcWithManagedBlock(existingZshrc);
+  if (updatedZshrc !== existingZshrc) {
+    writeFileAtomically(zshrcPath, updatedZshrc);
+  }
+
+  console.log(`Shell hook configured: ${zshrcPath}`);
+}
+
+function resolveHomeDirectory() {
+  const homeDir = process.env.HOME || os.homedir();
+  if (!homeDir) {
+    throw new Error("Unable to resolve HOME directory");
+  }
+  return path.resolve(homeDir);
+}
+
+function updateZshrcWithManagedBlock(contents) {
+  const normalized = contents.replace(/\r\n/g, "\n");
+  const managedBlock = buildManagedZshrcBlock();
+
+  if (normalized.includes(DEV_BOOTSTRAP_BLOCK_START) && normalized.includes(DEV_BOOTSTRAP_BLOCK_END)) {
+    const managedPattern = new RegExp(
+      `${escapeRegExp(DEV_BOOTSTRAP_BLOCK_START)}[\\s\\S]*?${escapeRegExp(DEV_BOOTSTRAP_BLOCK_END)}\\n?`,
+    );
+    return replaceBlockPreservingTrailingNewline(normalized, managedPattern, managedBlock);
+  }
+
+  const withoutLegacy = stripLegacyZshrcBlock(normalized);
+  if (!withoutLegacy.trim()) {
+    return managedBlock;
+  }
+
+  const separator = withoutLegacy.endsWith("\n\n") ? "" : withoutLegacy.endsWith("\n") ? "\n" : "\n\n";
+  return `${withoutLegacy}${separator}${managedBlock}`;
+}
+
+function buildManagedZshrcBlock() {
+  return [
+    DEV_BOOTSTRAP_BLOCK_START,
+    "# Managed by Dev bootstrap. Edit .custom in the Dev repo instead.",
+    '_dev_root_file="$HOME/.config/dev-bootstrap/root"',
+    'if [[ -r "$_dev_root_file" ]]; then',
+    '  _dev_root="$(<"$_dev_root_file")"',
+    '  _custom="$_dev_root/.custom"',
+    '  [[ -r "$_custom" ]] && source "$_custom" || echo ".custom not found at $_custom"',
+    "else",
+    '  echo "Dev root pointer missing: $_dev_root_file"',
+    "fi",
+    "unset _dev_root_file _dev_root _custom",
+    DEV_BOOTSTRAP_BLOCK_END,
+    "",
+  ].join("\n");
+}
+
+function stripLegacyZshrcBlock(contents) {
+  let updated = contents;
+  if (updated.includes(LEGACY_ZSHRC_BLOCK)) {
+    updated = updated.replace(`${LEGACY_ZSHRC_BLOCK}\n`, "");
+    updated = updated.replace(LEGACY_ZSHRC_BLOCK, "");
+  }
+
+  const genericLegacyPattern =
+    /# Bootstrap - source shared shell config from Dev root\n# \.custom contains: aliases, functions, automations, and reusable config\n# Edit with: ce \(opens \.custom\)  \|  Reload with: cs \(sources \.custom\)\n_p=.*?\n\[\[ -r "\$_p" \]\] && source "\$_p" \|\| echo .*?\nunset _p\n?/s;
+  return updated.replace(genericLegacyPattern, "");
+}
+
+function replaceBlockPreservingTrailingNewline(contents, pattern, replacement) {
+  const hadTrailingNewline = contents.endsWith("\n");
+  const replaced = contents.replace(pattern, replacement);
+  if (hadTrailingNewline || replaced.endsWith("\n")) {
+    return replaced;
+  }
+  return `${replaced}\n`;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

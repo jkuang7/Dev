@@ -76,6 +76,19 @@ function createDevLayout(tempRoot) {
   return { devRoot, reposRoot, configPath };
 }
 
+function createHomeEnv(tempRoot, extraEnv = {}) {
+  const homeDir = path.join(tempRoot, "home");
+  fs.mkdirSync(homeDir, { recursive: true });
+  return {
+    homeDir,
+    env: {
+      ...process.env,
+      ...extraEnv,
+      HOME: homeDir,
+    },
+  };
+}
+
 function createFakeTooling(tempRoot) {
   const binDir = path.join(tempRoot, "fake-bin");
   const logPath = path.join(tempRoot, "tool.log");
@@ -217,6 +230,7 @@ test("bootstrap clones missing repos and runs npm and pnpm installs", () => {
   const tempRoot = makeTempDir("repos-bootstrap-node-");
   const { devRoot, reposRoot, configPath } = createDevLayout(tempRoot);
   const tooling = createFakeTooling(tempRoot);
+  const home = createHomeEnv(tempRoot, tooling.env);
 
   try {
     const blogOrigin = createBareOrigin(tempRoot, "Blog", {
@@ -246,11 +260,17 @@ test("bootstrap clones missing repos and runs npm and pnpm installs", () => {
       ].join("\n"),
     );
 
-    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: tooling.env });
+    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
     assertSuccess(result);
 
     assert.equal(fs.existsSync(path.join(reposRoot, "Blog", "package.json")), true);
     assert.equal(fs.existsSync(path.join(reposRoot, "stonks-web-scaffold", "package.json")), true);
+
+    const pointerPath = path.join(home.homeDir, ".config", "dev-bootstrap", "root");
+    assert.equal(fs.readFileSync(pointerPath, "utf8"), `${devRoot}\n`);
+    const zshrc = fs.readFileSync(path.join(home.homeDir, ".zshrc"), "utf8");
+    assert.match(zshrc, /# >>> dev-bootstrap >>>/);
+    assert.match(zshrc, /\.config\/dev-bootstrap\/root/);
 
     const logLines = readLog(tooling.logPath);
     assert(logLines.some((line) => line.includes("npm|") && line.endsWith("|install")), logLines.join("\n"));
@@ -264,6 +284,7 @@ test("bootstrap creates venvs and installs requirements.txt and pyproject repos"
   const tempRoot = makeTempDir("repos-bootstrap-python-");
   const { devRoot, reposRoot, configPath } = createDevLayout(tempRoot);
   const tooling = createFakeTooling(tempRoot);
+  const home = createHomeEnv(tempRoot, tooling.env);
 
   try {
     const banksyOrigin = createBareOrigin(tempRoot, "Banksy", {
@@ -293,7 +314,7 @@ test("bootstrap creates venvs and installs requirements.txt and pyproject repos"
       ].join("\n"),
     );
 
-    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: tooling.env });
+    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
     assertSuccess(result);
 
     const logLines = readLog(tooling.logPath);
@@ -309,6 +330,7 @@ test("bootstrap sets up existing matching repos and skips origin mismatch and no
   const tempRoot = makeTempDir("repos-bootstrap-existing-");
   const { devRoot, reposRoot, configPath } = createDevLayout(tempRoot);
   const tooling = createFakeTooling(tempRoot);
+  const home = createHomeEnv(tempRoot, tooling.env);
 
   try {
     const goodOrigin = createBareOrigin(tempRoot, "Blog", {
@@ -342,7 +364,7 @@ test("bootstrap sets up existing matching repos and skips origin mismatch and no
       ].join("\n"),
     );
 
-    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: tooling.env });
+    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
     assertSuccess(result);
 
     const logLines = readLog(tooling.logPath);
@@ -358,6 +380,7 @@ test("bootstrap --with-build and --with-check choose the expected scripts", () =
   const tempRoot = makeTempDir("repos-bootstrap-build-check-");
   const { devRoot, configPath } = createDevLayout(tempRoot);
   const tooling = createFakeTooling(tempRoot);
+  const home = createHomeEnv(tempRoot, tooling.env);
 
   try {
     const verifyOrigin = createBareOrigin(tempRoot, "verify-repo", {
@@ -401,7 +424,7 @@ test("bootstrap --with-build and --with-check choose the expected scripts", () =
     );
 
     const result = runScript(["bootstrap", "--dev-root", devRoot, "--with-build", "--with-check"], {
-      env: tooling.env,
+      env: home.env,
     });
     assertSuccess(result);
 
@@ -420,6 +443,7 @@ test("bootstrap --with-build and --with-check choose the expected scripts", () =
 test("bootstrap parser fails on malformed and duplicate config lines", () => {
   const tempRoot = makeTempDir("repos-bootstrap-parse-");
   const { devRoot, configPath } = createDevLayout(tempRoot);
+  const home = createHomeEnv(tempRoot);
 
   try {
     writeFile(
@@ -433,8 +457,8 @@ test("bootstrap parser fails on malformed and duplicate config lines", () => {
       ].join("\n"),
     );
 
-    const malformed = runScript(["bootstrap", "--dev-root", devRoot]);
-    assertFailure(malformed, /expected "<directory>\\t<remote-origin-url>"/);
+    const malformed = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
+    assertFailure(malformed, /expected "<directory>\\t<remote-origin-url>\[\\t<branch>\]"/);
 
     writeFile(
       configPath,
@@ -446,8 +470,113 @@ test("bootstrap parser fails on malformed and duplicate config lines", () => {
       ].join("\n"),
     );
 
-    const duplicate = runScript(["bootstrap", "--dev-root", devRoot]);
+    const duplicate = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
     assertFailure(duplicate, /duplicate directory "Blog"/);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap replaces legacy zshrc hook with managed pointer block", () => {
+  const tempRoot = makeTempDir("repos-bootstrap-zshrc-");
+  const { devRoot, configPath } = createDevLayout(tempRoot);
+  const tooling = createFakeTooling(tempRoot);
+  const home = createHomeEnv(tempRoot, tooling.env);
+
+  try {
+    writeFile(
+      path.join(home.homeDir, ".zshrc"),
+      [
+        "# Bootstrap - source shared shell config from Dev root",
+        "# .custom contains: aliases, functions, automations, and reusable config",
+        "# Edit with: ce (opens .custom)  |  Reload with: cs (sources .custom)",
+        '_p="$HOME/Dev/.custom"',
+        '[[ -r "$_p" ]] && source "$_p" || echo "⚠ .custom not found at $_p"',
+        "unset _p",
+        "",
+        "export PATH=\"$PATH:/tmp/example\"",
+        "",
+      ].join("\n"),
+    );
+
+    const origin = createBareOrigin(tempRoot, "Blog", {
+      "package.json": JSON.stringify({ name: "blog" }, null, 2),
+      "package-lock.json": "{}\n",
+    });
+    writeFile(configPath, `Blog\t${origin}\n`);
+
+    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
+    assertSuccess(result);
+
+    const zshrc = fs.readFileSync(path.join(home.homeDir, ".zshrc"), "utf8");
+    assert.doesNotMatch(zshrc, /\$HOME\/Dev\/\.custom/);
+    assert.match(zshrc, /# >>> dev-bootstrap >>>/);
+    assert.match(zshrc, /Managed by Dev bootstrap/);
+    assert.match(zshrc, /export PATH="\$PATH:\/tmp\/example"/);
+    assert.equal((zshrc.match(/# >>> dev-bootstrap >>>/g) ?? []).length, 1);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap fast-forwards clean repos on main and skips dirty repos", () => {
+  const tempRoot = makeTempDir("repos-bootstrap-sync-");
+  const { devRoot, reposRoot, configPath } = createDevLayout(tempRoot);
+  const tooling = createFakeTooling(tempRoot);
+  const home = createHomeEnv(tempRoot, tooling.env);
+
+  try {
+    const cleanOrigin = createBareOrigin(tempRoot, "Blog", {
+      "package.json": JSON.stringify({ name: "blog" }, null, 2),
+      "package-lock.json": "{}\n",
+      "README.md": "v1\n",
+    });
+    const dirtyOrigin = createBareOrigin(tempRoot, "DeckFoundry", {
+      "package.json": JSON.stringify({ name: "deck" }, null, 2),
+      "package-lock.json": "{}\n",
+      "README.md": "deck-v1\n",
+    });
+
+    git(["clone", cleanOrigin, path.join(reposRoot, "Blog")], tempRoot);
+    git(["clone", dirtyOrigin, path.join(reposRoot, "DeckFoundry")], tempRoot);
+
+    const cleanSeed = path.join(tempRoot, "clean-seed");
+    const dirtySeed = path.join(tempRoot, "dirty-seed");
+    git(["clone", cleanOrigin, cleanSeed], tempRoot);
+    git(["clone", dirtyOrigin, dirtySeed], tempRoot);
+    git(["config", "user.name", "Test User"], cleanSeed);
+    git(["config", "user.email", "test@example.com"], cleanSeed);
+    git(["config", "user.name", "Test User"], dirtySeed);
+    git(["config", "user.email", "test@example.com"], dirtySeed);
+
+    writeFile(path.join(cleanSeed, "README.md"), "v2\n");
+    git(["add", "README.md"], cleanSeed);
+    git(["commit", "-m", "update clean"], cleanSeed);
+    git(["push", "origin", "main"], cleanSeed);
+
+    writeFile(path.join(dirtySeed, "README.md"), "deck-v2\n");
+    git(["add", "README.md"], dirtySeed);
+    git(["commit", "-m", "update dirty"], dirtySeed);
+    git(["push", "origin", "main"], dirtySeed);
+
+    writeFile(path.join(reposRoot, "DeckFoundry", "LOCAL_ONLY.txt"), "keep me\n");
+
+    writeFile(
+      configPath,
+      [
+        `Blog\t${cleanOrigin}`,
+        `DeckFoundry\t${dirtyOrigin}`,
+        "",
+      ].join("\n"),
+    );
+
+    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
+    assertSuccess(result);
+
+    assert.equal(fs.readFileSync(path.join(reposRoot, "Blog", "README.md"), "utf8"), "v2\n");
+    assert.equal(fs.readFileSync(path.join(reposRoot, "DeckFoundry", "README.md"), "utf8"), "deck-v1\n");
+    assert.match(`${result.stdout}\n${result.stderr}`, /sync ok \(fast-forwarded main\)/);
+    assert.match(`${result.stdout}\n${result.stderr}`, /sync skipped \(dirty worktree\)/);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
