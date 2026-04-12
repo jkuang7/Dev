@@ -20,6 +20,21 @@ const CONFIG_HEADER = [
 const DEFAULT_BRANCH = "main";
 const DEV_BOOTSTRAP_BLOCK_START = "# >>> dev-bootstrap >>>";
 const DEV_BOOTSTRAP_BLOCK_END = "# <<< dev-bootstrap <<<";
+const CODEX_SNAPSHOT_ROOT_PARTS = [".bootstrap", "codex"];
+const CODEX_SNAPSHOT_MANIFEST = "manifest.json";
+const CODEX_MANAGED_ENTRIES = [
+  "AGENTS.md",
+  "bin",
+  "commands",
+  "config",
+  "config.toml",
+  "memories",
+  "plugins",
+  "prompts",
+  "rules",
+  "session-tags.json",
+  "skills",
+];
 const LEGACY_ZSHRC_BLOCK = [
   "# Bootstrap - source shared shell config from Dev root",
   "# .custom contains: aliases, functions, automations, and reusable config",
@@ -152,6 +167,7 @@ function runGenerate(args) {
 
   const summary = {
     written: 0,
+    codexEntries: 0,
     skippedMissingOrigin: [],
     ignored: [],
   };
@@ -192,20 +208,24 @@ function runGenerate(args) {
 
   const contents = buildConfigFile(entries);
   writeFileAtomically(args.configPath, contents);
+  summary.codexEntries = exportCodexSnapshot(args.devRoot);
 
   summary.written = entries.length;
 
   console.log(`Wrote ${args.configPath}`);
   console.log(`written: ${summary.written}`);
+  console.log(`codex snapshot entries: ${summary.codexEntries}`);
   console.log(`skipped missing origin: ${summary.skippedMissingOrigin.length}`);
   console.log(`ignored non-standalone: ${summary.ignored.length}`);
 }
 
 function runBootstrap(args) {
   ensureShellHook(args.devRoot);
+  const codexRestored = importCodexSnapshot(args.devRoot);
   fs.mkdirSync(args.reposRoot, { recursive: true });
   const entries = parseConfigFile(args.configPath);
   const summary = {
+    codexRestored,
     pruned: 0,
     cloned: 0,
     exists: 0,
@@ -287,6 +307,7 @@ function runBootstrap(args) {
   }
 
   console.log("Summary:");
+  console.log(`codex restored: ${summary.codexRestored}`);
   console.log(`pruned: ${summary.pruned}`);
   console.log(`cloned: ${summary.cloned}`);
   console.log(`exists: ${summary.exists}`);
@@ -350,6 +371,111 @@ function buildConfigFile(entries) {
     ),
   ];
   return `${lines.join("\n")}\n`;
+}
+
+function resolveCodexSourceRoot() {
+  return path.join(resolveHomeDirectory(), ".codex");
+}
+
+function resolveCodexSnapshotRoot(devRoot) {
+  return path.join(devRoot, ...CODEX_SNAPSHOT_ROOT_PARTS);
+}
+
+function exportCodexSnapshot(devRoot) {
+  const sourceRoot = resolveCodexSourceRoot();
+  const snapshotRoot = resolveCodexSnapshotRoot(devRoot);
+
+  fs.mkdirSync(snapshotRoot, { recursive: true });
+  clearDirectory(snapshotRoot);
+
+  const exportedEntries = [];
+  for (const entryName of CODEX_MANAGED_ENTRIES) {
+    const sourcePath = path.join(sourceRoot, entryName);
+    if (!fs.existsSync(sourcePath)) {
+      continue;
+    }
+
+    copyPath(sourcePath, path.join(snapshotRoot, entryName));
+    exportedEntries.push(entryName);
+  }
+
+  writeFileAtomically(
+    path.join(snapshotRoot, CODEX_SNAPSHOT_MANIFEST),
+    JSON.stringify(
+      {
+        version: 1,
+        sourceRoot,
+        exportedAt: new Date().toISOString(),
+        entries: exportedEntries,
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+
+  return exportedEntries.length;
+}
+
+function importCodexSnapshot(devRoot) {
+  const snapshotRoot = resolveCodexSnapshotRoot(devRoot);
+  const manifestPath = path.join(snapshotRoot, CODEX_SNAPSHOT_MANIFEST);
+  if (!fs.existsSync(manifestPath)) {
+    console.log("Codex snapshot skipped (no managed snapshot found)");
+    return 0;
+  }
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  const targetRoot = resolveCodexSourceRoot();
+  const trackedEntries = Array.isArray(manifest.entries)
+    ? manifest.entries.filter((entry) => typeof entry === "string" && CODEX_MANAGED_ENTRIES.includes(entry))
+    : [];
+
+  fs.mkdirSync(targetRoot, { recursive: true });
+
+  for (const entryName of CODEX_MANAGED_ENTRIES) {
+    if (trackedEntries.includes(entryName)) {
+      continue;
+    }
+
+    const targetPath = path.join(targetRoot, entryName);
+    if (fs.existsSync(targetPath)) {
+      removePath(targetPath);
+    }
+  }
+
+  for (const entryName of trackedEntries) {
+    copyPath(path.join(snapshotRoot, entryName), path.join(targetRoot, entryName));
+  }
+
+  console.log(`Codex snapshot restored: ${trackedEntries.length} entries`);
+  return trackedEntries.length;
+}
+
+function clearDirectory(directoryPath) {
+  if (!fs.existsSync(directoryPath)) {
+    return;
+  }
+
+  for (const child of fs.readdirSync(directoryPath)) {
+    removePath(path.join(directoryPath, child));
+  }
+}
+
+function removePath(targetPath) {
+  fs.rmSync(targetPath, { recursive: true, force: true });
+}
+
+function copyPath(sourcePath, targetPath) {
+  removePath(targetPath);
+  const stat = fs.statSync(sourcePath);
+  if (stat.isDirectory()) {
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.cpSync(sourcePath, targetPath, { recursive: true });
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.copyFileSync(sourcePath, targetPath);
 }
 
 function writeFileAtomically(targetPath, contents) {

@@ -7,6 +7,8 @@
 # root control files
 !/AGENTS.md
 !/.custom
+!/.bootstrap/
+!/.bootstrap/**
 !/package.json
 !/.vscode/
 !/.vscode/**

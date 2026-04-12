@@ -1,0 +1,4 @@
+interface:
+  display_name: "Refactor"
+  short_description: "Zero-regression refactor planning and execution"
+  default_prompt: "Refactor this project for maintainability and reuse with zero behavior regression. Implement reusability in code (shared abstractions/utilities/components), run baseline verification first, and do not update documentation unless explicitly requested."

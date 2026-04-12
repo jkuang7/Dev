@@ -1,0 +1,4 @@
+interface:
+  display_name: "Env Setup"
+  short_description: "Audit project-scoped env and provider setup"
+  default_prompt: "Use $envsetup to audit this repo's env variables, verify provider resources belong only to this project, and pause for my manual 1Password login whenever browser auth is blocked."

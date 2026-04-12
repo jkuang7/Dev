@@ -1,0 +1,91 @@
+{
+	"attribution": {
+		"commit": "",
+		"pr": ""
+	},
+	"permissions": {
+		"allow": [
+			"Read(/Users/jian/**)",
+			"Edit(/Users/jian/**)",
+			"Write(/Users/jian/**)",
+			"Glob(**)",
+			"Grep(**)",
+			"Bash(chmod:*)",
+			"Bash(git:*)",
+			"Bash(ls:*)",
+			"Bash(ssh-keygen:*)",
+			"Bash(cat:*)",
+			"Bash(displayplacer:*)",
+			"Bash(echo:*)",
+			"Bash(grep:*)",
+			"Bash(source:*)",
+			"Bash(di)",
+			"Bash(functions di)",
+			"Bash(/tmp/di_fixed.sh:*)",
+			"Bash(mkdir:*)",
+			"Bash(./spack pack test_dir)",
+			"Bash(rm:*)",
+			"Bash(./spack unpack test_dir_packed)",
+			"Bash(mv:*)",
+			"Bash(./pack pack test_data)",
+			"Bash(./pack unpack:*)",
+			"Bash(pack:*)",
+			"Bash(cp:*)",
+			"Bash(touch:*)",
+			"Bash(wc:*)",
+			"Bash(head:*)",
+			"Bash(tail:*)",
+			"Bash(find:*)",
+			"Bash(sed:*)",
+			"Bash(awk:*)",
+			"Bash(sort:*)",
+			"Bash(uniq:*)",
+			"Bash(cut:*)",
+			"Bash(tr:*)",
+			"Bash(xargs:*)",
+			"Bash(which:*)",
+			"Bash(whereis:*)",
+			"Bash(pwd)",
+			"Bash(cd:*)",
+			"Bash(npm:*)",
+			"Bash(node:*)",
+			"Bash(npx:*)",
+			"Bash(yarn:*)",
+			"Bash(pnpm:*)",
+			"Bash(python:*)",
+			"Bash(python3:*)",
+			"Bash(pip:*)",
+			"Bash(pip3:*)",
+			"Bash(make:*)",
+			"Bash(curl:*)",
+			"Bash(wget:*)",
+			"Bash(tar:*)",
+			"Bash(zip:*)",
+			"Bash(unzip:*)",
+			"Bash(diff:*)",
+			"Bash(patch:*)",
+			"Bash(jq:*)",
+			"Bash(yq:*)"
+		],
+		"deny": [
+			"Read(**/recert/data/**)",
+			"Edit(**/recert/data/**)",
+			"Write(**/recert/data/**)",
+			"Glob(**/recert/data/**)",
+			"Grep(**/recert/data/**)"
+		]
+	},
+	"hooks": {
+		"Stop": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "/Users/jian/Dev/workspace/hooks/notify-codex.sh",
+						"timeout": 10
+					}
+				]
+			}
+		]
+	}
+}

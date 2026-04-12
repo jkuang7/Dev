@@ -84,6 +84,10 @@ function createFreshCloneLayout(tempRoot) {
   return { devRoot, reposRoot, configPath };
 }
 
+function codexSnapshotRoot(devRoot) {
+  return path.join(devRoot, ".bootstrap", "codex");
+}
+
 function createHomeEnv(tempRoot, extraEnv = {}) {
   const homeDir = path.join(tempRoot, "home");
   fs.mkdirSync(homeDir, { recursive: true });
@@ -234,6 +238,43 @@ test("generate leaves existing config untouched when zero valid repos are found"
   }
 });
 
+test("generate mirrors managed .codex entries into the hidden bootstrap snapshot", () => {
+  const tempRoot = makeTempDir("repos-bootstrap-codex-generate-");
+  const { devRoot, reposRoot, configPath } = createDevLayout(tempRoot);
+  const home = createHomeEnv(tempRoot);
+
+  try {
+    const blogOrigin = createBareOrigin(tempRoot, "Blog", {
+      "README.md": "blog\n",
+    });
+    git(["clone", blogOrigin, path.join(reposRoot, "Blog")], tempRoot);
+
+    const codexRoot = path.join(home.homeDir, ".codex");
+    writeFile(path.join(codexRoot, "config.toml"), "model = 'gpt-5.4'\n");
+    writeFile(path.join(codexRoot, "commands", "commit.md"), "# commit\n");
+    writeFile(path.join(codexRoot, "skills", "solo-kanban", "SKILL.md"), "# kanban\n");
+    writeFile(path.join(codexRoot, "logs", "runner.log"), "skip me\n");
+
+    const snapshotRoot = codexSnapshotRoot(devRoot);
+    writeFile(path.join(snapshotRoot, "stale.txt"), "remove me\n");
+
+    const result = runScript(["generate", "--dev-root", devRoot], { env: home.env });
+    assertSuccess(result);
+
+    assert.equal(fs.readFileSync(path.join(snapshotRoot, "config.toml"), "utf8"), "model = 'gpt-5.4'\n");
+    assert.equal(fs.readFileSync(path.join(snapshotRoot, "commands", "commit.md"), "utf8"), "# commit\n");
+    assert.equal(fs.readFileSync(path.join(snapshotRoot, "skills", "solo-kanban", "SKILL.md"), "utf8"), "# kanban\n");
+    assert.equal(fs.existsSync(path.join(snapshotRoot, "logs")), false);
+    assert.equal(fs.existsSync(path.join(snapshotRoot, "stale.txt")), false);
+
+    const manifest = JSON.parse(fs.readFileSync(path.join(snapshotRoot, "manifest.json"), "utf8"));
+    assert.deepEqual(manifest.entries, ["commands", "config.toml", "skills"]);
+    assert.match(result.stdout, /codex snapshot entries: 3/);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("bootstrap clones missing repos and runs npm and pnpm installs", () => {
   const tempRoot = makeTempDir("repos-bootstrap-node-");
   const { devRoot, reposRoot, configPath } = createDevLayout(tempRoot);
@@ -307,6 +348,51 @@ test("bootstrap creates the Repos root for a fresh clone layout", () => {
 
     assert.equal(fs.existsSync(reposRoot), true);
     assert.equal(fs.existsSync(path.join(reposRoot, "Blog", ".git")), true);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap mirrors the hidden .codex snapshot back into HOME", () => {
+  const tempRoot = makeTempDir("repos-bootstrap-codex-bootstrap-");
+  const { devRoot, configPath } = createDevLayout(tempRoot);
+  const home = createHomeEnv(tempRoot);
+
+  try {
+    const blogOrigin = createBareOrigin(tempRoot, "Blog", {
+      "README.md": "blog\n",
+    });
+    writeFile(configPath, `Blog\t${blogOrigin}\n`);
+
+    const snapshotRoot = codexSnapshotRoot(devRoot);
+    writeFile(path.join(snapshotRoot, "config.toml"), "model = 'gpt-5.4-mini'\n");
+    writeFile(path.join(snapshotRoot, "skills", "solo-kanban", "SKILL.md"), "# pulled\n");
+    writeFile(
+      path.join(snapshotRoot, "manifest.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: ["config.toml", "skills"],
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+
+    const codexRoot = path.join(home.homeDir, ".codex");
+    writeFile(path.join(codexRoot, "config.toml"), "model = 'stale'\n");
+    writeFile(path.join(codexRoot, "commands", "old.md"), "# stale managed entry\n");
+    writeFile(path.join(codexRoot, "logs", "runner.log"), "keep unmanaged runtime\n");
+
+    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
+    assertSuccess(result);
+
+    assert.equal(fs.readFileSync(path.join(codexRoot, "config.toml"), "utf8"), "model = 'gpt-5.4-mini'\n");
+    assert.equal(fs.readFileSync(path.join(codexRoot, "skills", "solo-kanban", "SKILL.md"), "utf8"), "# pulled\n");
+    assert.equal(fs.existsSync(path.join(codexRoot, "commands")), false);
+    assert.equal(fs.readFileSync(path.join(codexRoot, "logs", "runner.log"), "utf8"), "keep unmanaged runtime\n");
+    assert.match(result.stdout, /Codex snapshot restored: 2 entries/);
+    assert.match(result.stdout, /codex restored: 2/);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

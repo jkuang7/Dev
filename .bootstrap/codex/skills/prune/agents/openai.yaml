@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prune"
+  short_description: "Prune extra git worktrees safely"
+  default_prompt: "Use $prune to keep one checkout, usually the main repo on main, remove the other linked git worktrees, and clean up empty leftover worktree folders."
