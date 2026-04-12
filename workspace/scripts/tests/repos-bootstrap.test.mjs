@@ -252,7 +252,8 @@ test("generate mirrors managed .codex entries into the hidden bootstrap snapshot
     const codexRoot = path.join(home.homeDir, ".codex");
     writeFile(path.join(codexRoot, "config.toml"), "model = 'gpt-5.4'\n");
     writeFile(path.join(codexRoot, "commands", "commit.md"), "# commit\n");
-    writeFile(path.join(codexRoot, "skills", "solo-kanban", "SKILL.md"), "# kanban\n");
+    writeFile(path.join(codexRoot, "skills", "kanban", "SKILL.md"), "# kanban\n");
+    fs.mkdirSync(path.join(codexRoot, "memories"), { recursive: true });
     writeFile(path.join(codexRoot, "logs", "runner.log"), "skip me\n");
 
     const snapshotRoot = codexSnapshotRoot(devRoot);
@@ -263,8 +264,9 @@ test("generate mirrors managed .codex entries into the hidden bootstrap snapshot
 
     assert.equal(fs.readFileSync(path.join(snapshotRoot, "config.toml"), "utf8"), "model = 'gpt-5.4'\n");
     assert.equal(fs.readFileSync(path.join(snapshotRoot, "commands", "commit.md"), "utf8"), "# commit\n");
-    assert.equal(fs.readFileSync(path.join(snapshotRoot, "skills", "solo-kanban", "SKILL.md"), "utf8"), "# kanban\n");
+    assert.equal(fs.readFileSync(path.join(snapshotRoot, "skills", "kanban", "SKILL.md"), "utf8"), "# kanban\n");
     assert.equal(fs.existsSync(path.join(snapshotRoot, "logs")), false);
+    assert.equal(fs.existsSync(path.join(snapshotRoot, "memories")), false);
     assert.equal(fs.existsSync(path.join(snapshotRoot, "stale.txt")), false);
 
     const manifest = JSON.parse(fs.readFileSync(path.join(snapshotRoot, "manifest.json"), "utf8"));
@@ -366,7 +368,7 @@ test("bootstrap mirrors the hidden .codex snapshot back into HOME", () => {
 
     const snapshotRoot = codexSnapshotRoot(devRoot);
     writeFile(path.join(snapshotRoot, "config.toml"), "model = 'gpt-5.4-mini'\n");
-    writeFile(path.join(snapshotRoot, "skills", "solo-kanban", "SKILL.md"), "# pulled\n");
+    writeFile(path.join(snapshotRoot, "skills", "kanban", "SKILL.md"), "# pulled\n");
     writeFile(
       path.join(snapshotRoot, "manifest.json"),
       JSON.stringify(
@@ -388,11 +390,53 @@ test("bootstrap mirrors the hidden .codex snapshot back into HOME", () => {
     assertSuccess(result);
 
     assert.equal(fs.readFileSync(path.join(codexRoot, "config.toml"), "utf8"), "model = 'gpt-5.4-mini'\n");
-    assert.equal(fs.readFileSync(path.join(codexRoot, "skills", "solo-kanban", "SKILL.md"), "utf8"), "# pulled\n");
+    assert.equal(fs.readFileSync(path.join(codexRoot, "skills", "kanban", "SKILL.md"), "utf8"), "# pulled\n");
     assert.equal(fs.existsSync(path.join(codexRoot, "commands")), false);
     assert.equal(fs.readFileSync(path.join(codexRoot, "logs", "runner.log"), "utf8"), "keep unmanaged runtime\n");
     assert.match(result.stdout, /Codex snapshot restored: 2 entries/);
     assert.match(result.stdout, /codex restored: 2/);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap tolerates manifest entries whose snapshot paths are missing", () => {
+  const tempRoot = makeTempDir("repos-bootstrap-codex-missing-entry-");
+  const { devRoot, configPath } = createDevLayout(tempRoot);
+  const home = createHomeEnv(tempRoot);
+
+  try {
+    const blogOrigin = createBareOrigin(tempRoot, "Blog", {
+      "README.md": "blog\n",
+    });
+    writeFile(configPath, `Blog\t${blogOrigin}\n`);
+
+    const snapshotRoot = codexSnapshotRoot(devRoot);
+    writeFile(path.join(snapshotRoot, "config.toml"), "model = 'gpt-5.4-mini'\n");
+    writeFile(
+      path.join(snapshotRoot, "manifest.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          entries: ["config.toml", "memories"],
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+
+    const codexRoot = path.join(home.homeDir, ".codex");
+    writeFile(path.join(codexRoot, "config.toml"), "model = 'stale'\n");
+    fs.mkdirSync(path.join(codexRoot, "memories"), { recursive: true });
+
+    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
+    assertSuccess(result);
+
+    assert.equal(fs.readFileSync(path.join(codexRoot, "config.toml"), "utf8"), "model = 'gpt-5.4-mini'\n");
+    assert.equal(fs.existsSync(path.join(codexRoot, "memories")), false);
+    assert.match(result.stderr, /Codex snapshot skipped 1 missing managed entries from manifest/);
+    assert.match(result.stdout, /Codex snapshot restored: 1 entries/);
+    assert.match(result.stdout, /codex restored: 1/);
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }

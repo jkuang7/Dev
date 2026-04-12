@@ -1,14 +1,13 @@
 {
   "version": 1,
   "sourceRoot": "/Users/jian/.codex",
-  "exportedAt": "2026-04-12T21:53:45.063Z",
+  "exportedAt": "2026-04-12T21:58:01.326Z",
   "entries": [
     "AGENTS.md",
     "bin",
     "commands",
     "config",
     "config.toml",
-    "memories",
     "plugins",
     "prompts",
     "rules",

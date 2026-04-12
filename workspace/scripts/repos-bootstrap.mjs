@@ -395,6 +395,10 @@ function exportCodexSnapshot(devRoot) {
       continue;
     }
 
+    if (isEffectivelyEmptyDirectory(sourcePath)) {
+      continue;
+    }
+
     copyPath(sourcePath, path.join(snapshotRoot, entryName));
     exportedEntries.push(entryName);
   }
@@ -429,11 +433,12 @@ function importCodexSnapshot(devRoot) {
   const trackedEntries = Array.isArray(manifest.entries)
     ? manifest.entries.filter((entry) => typeof entry === "string" && CODEX_MANAGED_ENTRIES.includes(entry))
     : [];
+  const availableEntries = trackedEntries.filter((entryName) => fs.existsSync(path.join(snapshotRoot, entryName)));
 
   fs.mkdirSync(targetRoot, { recursive: true });
 
   for (const entryName of CODEX_MANAGED_ENTRIES) {
-    if (trackedEntries.includes(entryName)) {
+    if (availableEntries.includes(entryName)) {
       continue;
     }
 
@@ -443,12 +448,18 @@ function importCodexSnapshot(devRoot) {
     }
   }
 
-  for (const entryName of trackedEntries) {
+  for (const entryName of availableEntries) {
     copyPath(path.join(snapshotRoot, entryName), path.join(targetRoot, entryName));
   }
 
-  console.log(`Codex snapshot restored: ${trackedEntries.length} entries`);
-  return trackedEntries.length;
+  if (availableEntries.length !== trackedEntries.length) {
+    console.warn(
+      `Codex snapshot skipped ${trackedEntries.length - availableEntries.length} missing managed entries from manifest`,
+    );
+  }
+
+  console.log(`Codex snapshot restored: ${availableEntries.length} entries`);
+  return availableEntries.length;
 }
 
 function clearDirectory(directoryPath) {
@@ -459,6 +470,19 @@ function clearDirectory(directoryPath) {
   for (const child of fs.readdirSync(directoryPath)) {
     removePath(path.join(directoryPath, child));
   }
+}
+
+function isEffectivelyEmptyDirectory(targetPath) {
+  if (!fs.existsSync(targetPath)) {
+    return false;
+  }
+
+  const stat = fs.statSync(targetPath);
+  if (!stat.isDirectory()) {
+    return false;
+  }
+
+  return fs.readdirSync(targetPath).length === 0;
 }
 
 function removePath(targetPath) {
