@@ -23,16 +23,11 @@ const DEV_BOOTSTRAP_BLOCK_END = "# <<< dev-bootstrap <<<";
 const CODEX_SNAPSHOT_ROOT_PARTS = [".bootstrap", "codex"];
 const CODEX_SNAPSHOT_MANIFEST = "manifest.json";
 const CODEX_MANAGED_ENTRIES = [
-  "AGENTS.md",
   "bin",
   "commands",
-  "config",
   "config.toml",
-  "memories",
   "plugins",
-  "prompts",
   "rules",
-  "session-tags.json",
   "skills",
 ];
 const LEGACY_ZSHRC_BLOCK = [
