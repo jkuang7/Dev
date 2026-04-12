@@ -206,6 +206,7 @@ function runBootstrap(args) {
   fs.mkdirSync(args.reposRoot, { recursive: true });
   const entries = parseConfigFile(args.configPath);
   const summary = {
+    pruned: 0,
     cloned: 0,
     exists: 0,
     syncOk: 0,
@@ -218,6 +219,19 @@ function runBootstrap(args) {
     warnings: 0,
     errors: 0,
   };
+
+  for (const stalePath of findPrunableRepoPaths(args.reposRoot, entries)) {
+    const repoName = path.basename(stalePath);
+    const repoPrefix = `[${repoName}]`;
+    try {
+      fs.rmSync(stalePath, { recursive: true, force: true });
+      summary.pruned += 1;
+      console.log(`${repoPrefix} pruned (not tracked in config)`);
+    } catch (error) {
+      summary.errors += 1;
+      console.error(`${repoPrefix} error: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   for (const entry of entries) {
     const repoPrefix = `[${entry.directory}]`;
@@ -273,6 +287,7 @@ function runBootstrap(args) {
   }
 
   console.log("Summary:");
+  console.log(`pruned: ${summary.pruned}`);
   console.log(`cloned: ${summary.cloned}`);
   console.log(`exists: ${summary.exists}`);
   console.log(`sync ok: ${summary.syncOk}`);
@@ -288,6 +303,31 @@ function runBootstrap(args) {
   if (summary.errors > 0) {
     process.exitCode = 1;
   }
+}
+
+function findPrunableRepoPaths(reposRoot, entries) {
+  const trackedDirectories = new Set(entries.map((entry) => entry.directory));
+  const prunablePaths = [];
+
+  for (const child of fs.readdirSync(reposRoot, { withFileTypes: true })) {
+    if (!child.isDirectory()) {
+      continue;
+    }
+
+    if (child.name.startsWith(".")) {
+      continue;
+    }
+
+    if (trackedDirectories.has(child.name)) {
+      continue;
+    }
+
+    prunablePaths.push(path.join(reposRoot, child.name));
+  }
+
+  return prunablePaths.sort((left, right) => path.basename(left).localeCompare(path.basename(right), "en", {
+    sensitivity: "case",
+  }));
 }
 
 function ensureDirectoryExists(directoryPath, label) {

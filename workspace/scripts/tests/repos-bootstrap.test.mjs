@@ -312,6 +312,50 @@ test("bootstrap creates the Repos root for a fresh clone layout", () => {
   }
 });
 
+test("bootstrap prunes unmanaged repos to match the pushed config", () => {
+  const tempRoot = makeTempDir("repos-bootstrap-prune-");
+  const { devRoot, reposRoot, configPath } = createDevLayout(tempRoot);
+  const tooling = createFakeTooling(tempRoot);
+  const home = createHomeEnv(tempRoot, tooling.env);
+
+  try {
+    const trackedOrigin = createBareOrigin(tempRoot, "Banksy", {
+      "package.json": JSON.stringify({ name: "banksy" }, null, 2),
+      "package-lock.json": "{}\n",
+    });
+    const staleOrigin = createBareOrigin(tempRoot, "stale-repo", {
+      "package.json": JSON.stringify({ name: "stale" }, null, 2),
+      "package-lock.json": "{}\n",
+    });
+
+    git(["clone", trackedOrigin, path.join(reposRoot, "Banksy")], tempRoot);
+    git(["clone", staleOrigin, path.join(reposRoot, "stale-repo")], tempRoot);
+    fs.mkdirSync(path.join(reposRoot, ".memory"), { recursive: true });
+
+    writeFile(
+      configPath,
+      [
+        "# Managed repositories - one per line",
+        "# Format: <directory>\\t<remote-origin-url>",
+        "",
+        `Banksy\t${trackedOrigin}`,
+        "",
+      ].join("\n"),
+    );
+
+    const result = runScript(["bootstrap", "--dev-root", devRoot], { env: home.env });
+    assertSuccess(result);
+
+    assert.equal(fs.existsSync(path.join(reposRoot, "Banksy", ".git")), true);
+    assert.equal(fs.existsSync(path.join(reposRoot, "stale-repo")), false);
+    assert.equal(fs.existsSync(path.join(reposRoot, ".memory")), true);
+    assert.match(result.stdout, /pruned: 1/);
+    assert.match(result.stdout, /\[stale-repo\] pruned \(not tracked in config\)/);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("bootstrap creates venvs and installs requirements.txt and pyproject repos", () => {
   const tempRoot = makeTempDir("repos-bootstrap-python-");
   const { devRoot, reposRoot, configPath } = createDevLayout(tempRoot);
