@@ -23,6 +23,14 @@ class SkillContractTests(unittest.TestCase):
             "Explicitly deprecate the original implementation detail so future agents do not execute from stale mixed-scope text.",
             contents,
         )
+        self.assertIn(
+            "If the user says `enhance if applicable`, proactively inspect Project `5` in repo or workspace scope before deciding whether the skill applies.",
+            contents,
+        )
+        self.assertIn(
+            "Use the shared kanban helper to surface candidate issues from Project `5`, then use GitHub MCP to read the actual issues and comments in repo scope before deciding whether enhancement is applicable.",
+            contents,
+        )
 
     def test_kanban_rejects_tracker_issues_as_execution_specs(self):
         contents = KANBAN_SKILL.read_text()
