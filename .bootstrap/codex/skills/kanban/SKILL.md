@@ -23,7 +23,7 @@ Override these only when the user explicitly says to.
    - Derive the current GitHub repo from `origin`.
    - If the current directory is a workspace root that also contains child repos such as `Repos/*/.git`, treat it as a multi-repo workspace instead of assuming the root repo is the only candidate.
 2. Before starting anything new, sync the local repo or workspace when safe:
-   - If the current repo or workspace exposes a pre-work sync command such as `bs:pull` or `bootstrap:pull`, prefer running it before picking new work.
+   - If the current repo or workspace exposes a pre-work sync command such as `pull`, prefer running it before picking new work.
    - Skip automatic sync when the current worktree is dirty, detached, or otherwise unsafe to update in place.
    - Report when sync was skipped for safety instead of pretending the workspace is current.
 3. Before starting anything new, check for an active issue:
@@ -100,7 +100,7 @@ Override these only when the user explicitly says to.
 Run pre-work sync when the repo supports it:
 
 ```bash
-npm run bs:pull
+npm run pull
 ```
 
 Find the next task for the current repo:

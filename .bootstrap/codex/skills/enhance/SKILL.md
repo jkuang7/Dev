@@ -7,11 +7,11 @@ description: Turn rough ideas, weak tickets, or oversized mixed-scope requests i
 
 Use this skill to prepare tickets that feed directly into the `/kanban` workflow.
 
-This skill is upstream of `kanban`, not separate from it. Reuse the same owner, GitHub Project, status values, and repo/project-field mapping unless the user explicitly overrides them.
+This skill is upstream of `kanban`, not separate from it. Reuse the same owner, GitHub Project, status values, repo selection rules, and project-location logic unless the user explicitly overrides them.
 
 Tool split:
 
-- Use GitHub MCP for issue and thread reads, repo context, and comment-side operations when those are needed.
+- Use GitHub MCP for repo context, searching existing tickets in the correct repo or workspace scope, issue and thread reads, and comment-side operations when those are needed.
 - Use the shared `kanban` helper plus `gh` for issue creation, issue editing, and GitHub Project field updates, because the GitHub MCP surface in this environment does not expose full issue creation or project mutation directly.
 
 ## Defaults
@@ -27,15 +27,21 @@ Tool split:
 
 1. Ground in the current repo or workspace first:
    - Read the local `AGENTS.md` and derive the current GitHub repo from `origin` when you are inside a repo.
-   - If the current directory is a workspace root containing child repos such as `Repos/*/.git`, do not guess the target repo when the request is ambiguous. Ask only for the repo if that cannot be inferred safely.
-   - Default the Project field to the repo name, matching `/kanban`, but do not force it when the GitHub Project does not expose a matching option.
-2. Decide whether the work should stay as one ticket or split:
+   - If the current directory is a workspace root containing child repos such as `Repos/*/.git`, mirror `/kanban`: treat it as a multi-repo workspace instead of assuming the root repo is the only candidate.
+   - Search for related or existing tickets with GitHub MCP in the same location `/kanban` would use: the current repo when it is clear, or the local child repos under `Repos/` when working from a workspace root.
+   - Do not search globally by default. If the correct repo cannot be inferred safely from the request or local workspace context, ask only for the repo.
+   - Treat a matching custom `Project` field as optional metadata, not as the source of truth for locating tickets. Default the Project field to the repo name only when the board exposes a matching option.
+2. Search existing tickets before drafting or splitting:
+   - Use GitHub MCP issue search in the selected repo or local repo set first so you do not create duplicates or miss a tracker or child ticket that already exists.
+   - When you find a likely match, read the issue body and latest comments before drafting changes, because the thread may supersede the original ticket text.
+   - If the request references an existing umbrella, tracker, or issue URL, fetch that issue and any relevant linked tickets before deciding the new structure.
+3. Decide whether the work should stay as one ticket or split:
    - Keep one ticket only when the scope is cohesive, bounded, and can be executed as one unit.
    - Split when the request mixes repos, phases, dependencies, blocked follow-ups, or work that should not share one execution loop.
    - Group simple changes together instead of fragmenting them.
    - Prefer child tickets over one oversized parent when that makes `/kanban` execution clearer.
    - When a parent ticket in `Dev` mentions unrelated problems for different repos, treat repo routing as part of the split itself, not as a later cleanup step.
-3. Convert each resulting work item into an enhanced ticket draft:
+4. Convert each resulting work item into an enhanced ticket draft:
    - Produce a concise, specific title.
    - Expand the body into a usable issue with enough detail for future execution, not just a reminder.
    - Include these sections when they add signal:
@@ -47,24 +53,25 @@ Tool split:
      - Risks or open questions
    - Keep it practical. Do not write product-manager fluff.
    - Assign repo and project metadata per child ticket based on that child ticket's actual scope, not based on the parent umbrella issue's repo.
-4. When splitting an existing umbrella or overloaded ticket:
+5. When splitting an existing umbrella or overloaded ticket:
    - Treat the new child tickets as the future source of truth.
    - Rewrite the original issue into a tracker when you can edit it.
    - Explicitly deprecate the original implementation detail so future agents do not execute from stale mixed-scope text.
    - If body editing is blocked, leave a clear superseding comment that points at the child tickets and says the old description is deprecated.
    - Do not leave both the old umbrella text and the new child tickets as competing specs.
-5. Infer the issue classification:
+6. Infer the issue classification:
    - Choose `Type` from `Feature`, `Bug`, or `Refactor` when the field exists.
    - Add a matching GitHub label when that label exists or when the repo convention is obvious.
    - Choose a reasonable `Priority` only when the user supplied urgency or the issue clearly implies one; otherwise leave it unset.
    - For complex or externally-scoped requests, gather current context before drafting when that materially improves the decomposition or acceptance criteria.
-6. Use HIL before creating anything:
+7. Use HIL before creating anything:
    - Show the user the enriched draft and the exact metadata you plan to apply: repo, status, Project field, Type, Priority, labels.
    - When splitting, show the proposed parent/child structure and which ticket becomes the source of truth.
+   - If you found existing related tickets via GitHub MCP, include the ones you plan to reuse, supersede, or avoid duplicating.
    - Keep the approval loop lightweight. Ask only the highest-leverage clarification questions.
    - Ask for explicit approval or edits.
    - Do not create the issue, move project state, or post comments until the user approves the enriched draft.
-7. After approval, create the issue or issues:
+8. After approval, create the issue or issues:
    - Write the approved body to a temporary file.
    - Prefer GitHub MCP for repo or issue context gathering before creation.
    - For a new issue, run:
@@ -84,8 +91,8 @@ python3 ~/.codex/skills/kanban/scripts/github_project_issue_flow.py create-issue
    - Prefer `Inbox` by default. Use `Ready` only when the user explicitly wants the ticket to be immediately actionable.
    - For an existing issue that should become a tracker, use `gh issue edit` or equivalent tooling to replace the stale body after the child tickets exist.
    - If project field mutation fails only because the board has no matching option for that repo, continue and report that the field was intentionally left unset.
-8. After creation, hand back the issue URL or URLs, the applied project fields, and any tracker or deprecation update that was made.
-9. Do not start implementation automatically. Ticket creation ends here; `/kanban` owns the execution loop.
+9. After creation, hand back the issue URL or URLs, the applied project fields, and any tracker or deprecation update that was made.
+10. Do not start implementation automatically. Ticket creation ends here; `/kanban` owns the execution loop.
 
 ## Draft Shape
 
@@ -124,9 +131,11 @@ Use this body shape unless the repo or request clearly needs something else:
 - If the current repo is clear, use it.
 - If the user explicitly names a repo or app, use that.
 - If you are at `/Users/jian/Dev` and the request could map to multiple repos under `Repos/`, ask which repo the ticket belongs to before creating it.
+- If you are at a workspace root and the request can be resolved from local child repos, search those repos with GitHub MCP before asking the user.
 - If one source ticket mentions multiple repos, choose the repo separately for each child ticket.
 - Do not keep all child tickets in the parent repo just because the original umbrella issue lived there.
 - Set the GitHub Project field from the child ticket's repo when the board exposes a matching option; otherwise leave that field unset and report it.
+- Do not rely on the GitHub Project field to discover tickets. Discover with GitHub MCP in the correct repo or workspace scope first, then apply project metadata.
 
 ## Split Heuristics
 
@@ -146,5 +155,6 @@ Use this body shape unless the repo or request clearly needs something else:
 
 - Treat screenshots or pasted notes from the user as source material for the draft.
 - Optimize for tickets that a future agent can execute without rediscovering the whole problem.
+- Use GitHub MCP as the default way to search for existing issues in the correct location before creating or rewriting tickets.
 - Keep the approval loop lightweight: one enriched draft, one approval, then create.
 - Do not claim GitHub MCP created the ticket when the actual create or project-mutation path used `gh` through the shared helper.

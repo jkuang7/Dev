@@ -36,7 +36,7 @@ class SkillContractTests(unittest.TestCase):
             contents,
         )
         self.assertIn(
-            "If the current repo or workspace exposes a pre-work sync command such as `bs:pull` or `bootstrap:pull`, prefer running it before picking new work.",
+            "If the current repo or workspace exposes a pre-work sync command such as `pull`, prefer running it before picking new work.",
             contents,
         )
 
